@@ -1,3 +1,37 @@
+// =============================================================================
+// hnswalg.h — Hierarchical Navigable Small World (HNSW) graph index
+//
+// Purpose:
+//   Implements approximate nearest neighbor (ANN) search using the HNSW
+//   algorithm (Malkov & Yashunin 2018).  HNSW builds a multi-layer proximity
+//   graph where:
+//     - Layer 0 contains ALL nodes with the most edges (maxM0_ = 2*M per node).
+//     - Higher layers contain exponentially fewer nodes (prob ∝ 1/M) with
+//       fewer edges (maxM_ = M per node).
+//     - Search navigates top-down: greedy descent through upper layers to find
+//       a good entry point, then beam search at layer 0 for final results.
+//
+// Key parameters:
+//   M (default 16)           : number of bidirectional links per node.
+//                              Higher → better recall, more memory & build time.
+//   ef_construction (200)    : beam width during index build.
+//                              Higher → better graph quality, slower build.
+//   ef_ (10, set via setEf)  : beam width during search.
+//                              Higher → better recall, slower queries.
+//
+// Memory layout (layer 0, data_level0_memory_):
+//   Each element occupies size_data_per_element_ bytes:
+//     [links: maxM0_×4B + 4B count][vector data: data_size_][label: 8B]
+//   Higher-layer links are in separate heap allocations via linkLists_[i].
+//
+// Thread safety:
+//   - addPoint is thread-safe (uses per-element and global mutexes).
+//   - searchKnn / searchKnnCloserFirst are read-only and thread-safe.
+//   - markDelete / unmarkDelete use per-label mutexes (65536 buckets).
+//
+// tableint   : uint32 internal node ID (saves memory vs size_t).
+// labeltype  : size_t external user-visible label.
+// =============================================================================
 #pragma once
 
 #include "visited_list_pool.h"
@@ -204,6 +238,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // getRandomLevel — samples the layer height for a new node.
+    // Uses an exponential distribution: level = floor(-ln(U) * revSize_).
+    // revSize_ = 1/ln(M), so on average 1/M nodes reach each successive layer —
+    // this mirrors the skip-list probability and gives O(log N) layer heights.
     int getRandomLevel(double reverse_size) {
         std::uniform_real_distribution<double> distribution(0.0, 1.0);
         double r = -log(distribution(level_generator_)) * reverse_size;
@@ -222,6 +260,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return num_deleted_;
     }
 
+    // searchBaseLayer — beam search used ONLY during index construction (addPoint).
+    // Uses ef_construction_ as the beam width.  Returns top_candidates (max-heap,
+    // farthest-first) of the ef_construction_ closest found nodes at `layer`.
+    // candidateSet is a min-heap (negated distances) acting as the frontier.
+    // SSE prefetch hints pre-load visited_array and data pointers one iteration
+    // ahead to hide memory latency on large graphs.
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayer(tableint ep_id, const void *data_point, int layer) {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
@@ -305,6 +349,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // searchBaseLayerST — beam search used during QUERY time (searchKnn).
+    // Template parameter bare_bone_search=true skips deletion checks and the
+    // stop_condition for maximum speed when no deleted elements exist.
+    // Uses ef (passed as argument) instead of ef_construction_ for beam width.
+    // collect_metrics=true enables hop/distance-computation counters.
     // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
     template <bool bare_bone_search = true, bool collect_metrics = false>
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
@@ -440,6 +489,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // getNeighborsByHeuristic2 — HNSW neighbor selection heuristic (Algorithm 4).
+    // From the top_candidates set, selects up to M neighbors such that each
+    // selected neighbor is closer to the query than to any already-selected
+    // neighbor.  This produces a more diverse neighbor set than simply taking
+    // the M closest, which improves graph connectivity and search quality.
+    // Result is written back into top_candidates (the input queue is cleared).
     void getNeighborsByHeuristic2(
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> &top_candidates,
         const size_t M) {
@@ -503,6 +558,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // mutuallyConnectNewElement — wires a new node into the graph at one layer.
+    // Steps:
+    //   1. Prune top_candidates to M neighbors via getNeighborsByHeuristic2.
+    //   2. Store selected neighbors in cur_c's link list.
+    //   3. For each selected neighbor, add cur_c to their link list.
+    //      If their list is full (sz == Mcurmax), run the heuristic again to
+    //      decide which existing link to replace — keeping the best M neighbors.
+    // Returns the closest selected neighbor as the new entry point for the next layer.
     tableint mutuallyConnectNewElement(
         const void *data_point,
         tableint cur_c,
@@ -1267,6 +1330,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    // searchKnn — top-level k-NN query (Algorithm 5 from the HNSW paper).
+    // Phase 1 (upper layers, level maxlevel_ down to 1):
+    //   Greedy descent — at each layer follow the neighbor with smallest
+    //   distance until no improvement is found. O(log N) hops total.
+    //   The exit node of each layer becomes the entry point for the next.
+    // Phase 2 (layer 0):
+    //   Beam search via searchBaseLayerST with width max(ef_, k).
+    //   bare_bone_search=true when no deleted elements exist (faster path).
+    // Result is the top-k from the beam, returned as a max-heap (farthest-first).
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;

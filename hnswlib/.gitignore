@@ -11,3 +11,4 @@ var/
 .vs/
 **.DS_Store
 *.pyc
+.claude/

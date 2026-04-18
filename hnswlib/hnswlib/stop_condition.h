@@ -1,3 +1,28 @@
+// =============================================================================
+// stop_condition.h — Pluggable search termination policies for HNSW
+//
+// Purpose:
+//   Provides concrete implementations of BaseSearchStopCondition that extend
+//   standard k-NN search with two specialized modes:
+//
+//   1. MultiVectorSearchStopCondition<DOCIDTYPE, dist_t>
+//      Used when multiple vectors represent a single "document" (e.g., passage
+//      embeddings).  The goal is to find the top-`num_docs_to_search_` distinct
+//      documents, not vectors.  ef_collection_ controls beam width (must be
+//      ≥ num_docs_to_search_).  Tracks how many distinct doc IDs are in the
+//      result set via doc_counter_ map; search stops when ef_collection_ docs
+//      are found and the next candidate can't improve them.
+//
+//   2. EpsilonSearchStopCondition<dist_t>
+//      Returns ALL vectors within distance epsilon of the query, bounded by
+//      [min_num_candidates_, max_num_candidates_].  Useful for range queries.
+//      Search stops either when the result set is full AND the next candidate
+//      is farther than the current farthest, OR when the candidate distance
+//      exceeds epsilon and the minimum count has been reached.
+//
+//   Both classes also define BaseMultiVectorSpace<DOCIDTYPE> to attach a
+//   doc_id field immediately after the vector data in memory.
+// =============================================================================
 #pragma once
 #include "space_l2.h"
 #include "space_ip.h"

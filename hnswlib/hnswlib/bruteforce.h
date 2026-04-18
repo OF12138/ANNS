@@ -1,3 +1,24 @@
+// =============================================================================
+// bruteforce.h — Exact k-NN via exhaustive linear scan (thread-safe)
+//
+// Purpose:
+//   BruteforceSearch<dist_t> implements AlgorithmInterface with a flat
+//   in-memory store. Every query computes distance to ALL stored vectors,
+//   so recall is always 1.0. It serves two roles:
+//     1. Correctness baseline / ground-truth generator.
+//     2. Small-dataset fallback when building an HNSW graph isn't worth it.
+//
+// Memory layout:
+//   data_[] is a flat char array. Each element occupies size_per_element_ bytes:
+//     [0 .. data_size_-1]               : raw vector bytes
+//     [data_size_ .. data_size_+sizeof(labeltype)-1] : external label
+//   Elements are stored densely; removePoint swaps the last element into the
+//   deleted slot (O(1) removal without gaps).
+//
+// Thread safety:
+//   addPoint / removePoint are protected by index_lock (coarse mutex).
+//   searchKnn is read-only and lock-free.
+// =============================================================================
 #pragma once
 #include <unordered_map>
 #include <fstream>
@@ -61,6 +82,9 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
     }
 
 
+    // addPoint — insert or overwrite a vector.
+    // If label already exists, the stored vector is updated in-place.
+    // Otherwise a new slot is allocated (dense, sequential).
     void addPoint(const void *datapoint, labeltype label, bool replace_deleted = false) {
         int idx;
         {
@@ -68,6 +92,7 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
 
             auto search = dict_external_to_internal.find(label);
             if (search != dict_external_to_internal.end()) {
+                // Label already present — reuse its internal slot.
                 idx = search->second;
             } else {
                 if (cur_element_count >= maxelements_) {
@@ -78,11 +103,15 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
                 cur_element_count++;
             }
         }
+        // Write label then vector data into the flat array slot.
         memcpy(data_ + size_per_element_ * idx + data_size_, &label, sizeof(labeltype));
         memcpy(data_ + size_per_element_ * idx, datapoint, data_size_);
     }
 
 
+    // removePoint — delete an element by external label.
+    // Implements O(1) removal by swapping the last element into the freed slot,
+    // keeping the array dense (no holes).
     void removePoint(labeltype cur_external) {
         std::unique_lock<std::mutex> lock(index_lock);
 
@@ -94,6 +123,7 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
         dict_external_to_internal.erase(found);
 
         size_t cur_c = found->second;
+        // Move the last element into the freed slot.
         labeltype label = *((labeltype*)(data_ + size_per_element_ * (cur_element_count-1) + data_size_));
         dict_external_to_internal[label] = cur_c;
         memcpy(data_ + size_per_element_ * cur_c,
@@ -103,11 +133,16 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
     }
 
 
+    // searchKnn — exhaustive linear scan returning k nearest neighbors.
+    // Maintains a max-heap of size k: seeds with first k elements,
+    // then replaces the current farthest whenever a closer vector is found.
+    // Respects optional isIdAllowed filter per candidate.
     std::priority_queue<std::pair<dist_t, labeltype >>
     searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
         assert(k <= cur_element_count);
         std::priority_queue<std::pair<dist_t, labeltype >> topResults;
         if (cur_element_count == 0) return topResults;
+        // Seed heap with first k elements.
         for (int i = 0; i < k; i++) {
             dist_t dist = fstdistfunc_(query_data, data_ + size_per_element_ * i, dist_func_param_);
             labeltype label = *((labeltype*) (data_ + size_per_element_ * i + data_size_));
@@ -116,6 +151,7 @@ class BruteforceSearch : public AlgorithmInterface<dist_t> {
             }
         }
         dist_t lastdist = topResults.empty() ? std::numeric_limits<dist_t>::max() : topResults.top().first;
+        // Scan remaining elements, replacing heap top when a closer vector appears.
         for (int i = k; i < cur_element_count; i++) {
             dist_t dist = fstdistfunc_(query_data, data_ + size_per_element_ * i, dist_func_param_);
             if (dist <= lastdist) {

@@ -1,8 +1,40 @@
+// =============================================================================
+// space_l2.h — Squared L2 (Euclidean) distance functions with SIMD acceleration
+//
+// Purpose:
+//   Provides the L2Space and L2SpaceI metric spaces for float32 and uint8
+//   vectors respectively. The constructor automatically selects the fastest
+//   available SIMD implementation at runtime:
+//
+//   Scalar fallback (always available):
+//     L2Sqr          — generic loop, any dimension
+//     L2SqrI / L2SqrI4x — uint8 scalar variants (no SIMD)
+//
+//   SSE (128-bit, 4 floats/cycle):
+//     L2SqrSIMD16ExtSSE  — processes 16 floats per outer iteration (4 SSE ops)
+//     L2SqrSIMD4Ext      — processes 4 floats per iteration
+//     *Residuals variants — handle dimensions not divisible by 16 or 4
+//
+//   AVX (256-bit, 8 floats/cycle):
+//     L2SqrSIMD16ExtAVX  — processes 16 floats per outer iteration (2 AVX ops)
+//
+//   AVX-512 (512-bit, 16 floats/cycle):
+//     L2SqrSIMD16ExtAVX512 — processes 16 floats per single ZMM op
+//
+// Selection logic in L2Space constructor:
+//   dim % 16 == 0  →  L2SqrSIMD16Ext  (widest SIMD, no residuals)
+//   dim % 4 == 0   →  L2SqrSIMD4Ext   (SSE only, no residuals)
+//   dim > 16       →  L2SqrSIMD16ExtResiduals  (SIMD bulk + scalar tail)
+//   dim > 4        →  L2SqrSIMD4ExtResiduals
+//   else           →  scalar L2Sqr
+// =============================================================================
 #pragma once
 #include "hnswlib.h"
 
 namespace hnswlib {
 
+// L2Sqr — scalar squared Euclidean distance (reference / fallback)
+// Returns sum((v1[i] - v2[i])^2) for i in [0, qty).
 static float
 L2Sqr(const void *pVect1v, const void *pVect2v, const void *qty_ptr) {
     float *pVect1 = (float *) pVect1v;

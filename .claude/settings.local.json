@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//e/Code/Parallel/**)",
+      "Bash(find . -maxdepth 3 -type d -name \"*ANNS*\" -o -name \"*anns*\")"
+    ]
+  }
+}

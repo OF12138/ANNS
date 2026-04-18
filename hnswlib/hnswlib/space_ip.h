@@ -1,8 +1,40 @@
+// =============================================================================
+// space_ip.h — Inner Product (IP) distance functions with SIMD acceleration
+//
+// Purpose:
+//   Provides the InnerProductSpace metric space used by the DEEP100K dataset.
+//   "Distance" here is defined as 1 - dot(v1, v2), so maximizing dot product
+//   corresponds to minimizing distance. All *Distance variants return 1 - IP.
+//
+//   The SIMD hierarchy mirrors space_l2.h:
+//     Scalar:   InnerProduct / InnerProductDistance
+//     SSE:      InnerProductSIMD4ExtSSE  (4 floats/iter)
+//               InnerProductSIMD16ExtSSE (16 floats per outer loop, 4 SSE ops)
+//     AVX:      InnerProductSIMD4ExtAVX  (handles 4-aligned tail after AVX bulk)
+//               InnerProductSIMD16ExtAVX (16 floats per outer loop, 2 AVX ops)
+//     AVX-512:  InnerProductSIMD16ExtAVX512 (16 floats/iter with FMA, 4 unrolled)
+//
+//   The AVX-512 variant uses _mm512_fmadd_ps (fused multiply-add) for better
+//   throughput and 4× loop unrolling to hide FMA latency.
+//
+// Selection logic in InnerProductSpace constructor:
+//   dim % 16 == 0  → InnerProductDistanceSIMD16Ext
+//   dim % 4 == 0   → InnerProductDistanceSIMD4Ext
+//   dim > 16       → InnerProductDistanceSIMD16ExtResiduals
+//   dim > 4        → InnerProductDistanceSIMD4ExtResiduals
+//   else           → scalar InnerProductDistance
+//
+// Note: DEEP100K vectors have dim=96, which is divisible by 16, so the widest
+// SIMD path (16Ext) is always selected on capable hardware.
+// =============================================================================
 #pragma once
 #include "hnswlib.h"
 
 namespace hnswlib {
 
+// InnerProduct — scalar dot product (reference / fallback)
+// Returns sum(v1[i] * v2[i]) for i in [0, qty).  NOT a distance — must
+// subtract from 1.0 to get InnerProductDistance.
 static float
 InnerProduct(const void *pVect1, const void *pVect2, const void *qty_ptr) {
     size_t qty = *((size_t *) qty_ptr);
