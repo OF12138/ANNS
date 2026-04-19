@@ -34,7 +34,8 @@ flat_search_normal(float* base, float* query,
     for (size_t i = 0; i < base_number; ++i) {
         float dis = 0.0f;
 
-        // Scalar dot product: processes one float per cycle
+        // size_t counters produce 64-bit address arithmetic, which differs
+        // from flat_scan.h's int counters and changes -O2 auto-vectorization.
         for (size_t d = 0; d < vecdim; ++d) {
             dis += base[d + i * vecdim] * query[d];
         }

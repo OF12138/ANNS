@@ -41,8 +41,8 @@
 #include <sys/time.h>
 #include <omp.h>
 #include "hnswlib/hnswlib/hnswlib.h"
-#include "flat_scan.h"
-#include "ARM/Alg_parallel/flat_simd.h"  // NEON SIMD flat scan
+#include "ARM/Alg_normal/flat_scan.h"
+#include "ARM/Alg_parallel/flat_simd.h"  // NEON SIMD flat scan (active)
 
 using namespace hnswlib;
 
