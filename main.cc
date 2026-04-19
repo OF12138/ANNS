@@ -40,86 +40,11 @@
 #include <sstream>
 #include <sys/time.h>
 #include <omp.h>
-#include <immintrin.h>        // AVX2 / FMA intrinsics (_mm256_*, _mm_*)
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "flat_scan.h"
+#include "ARM/Alg_parallel/flat_simd.h"  // NEON SIMD flat scan
 
 using namespace hnswlib;
-
-// =============================================================================
-// SIMD-accelerated flat scan (Stage 1 — Flat-SIMD)
-//
-// Replaces the scalar flat_search with AVX2 vectorized dot products.
-// Requires compiler flags: -mavx2 -mfma  (add -mfma alongside -mavx2 in qsub)
-// =============================================================================
-
-// simd_inner_product — dot product of two float32 vectors using AVX2 + FMA
-//
-// Processes 8 floats per SIMD lane per iteration.
-// dim=96 is divisible by 8, so the loop covers all elements with zero remainder.
-//
-// Layout: a[0..dim-1], b[0..dim-1] — contiguous float arrays.
-inline float simd_inner_product(const float* a, const float* b, size_t dim)
-{
-    // 256-bit accumulator holding 8 partial sums (one per float lane), init 0
-    __m256 acc = _mm256_setzero_ps();
-
-    for (size_t d = 0; d < dim; d += 8) 
-    {
-        // Load 8 floats from each vector; loadu = unaligned load (no alignment req)
-        __m256 va = _mm256_loadu_ps(a + d);
-        __m256 vb = _mm256_loadu_ps(b + d);
-
-        // Fused multiply-add: acc = acc + va * vb  (single instruction, 1 cycle)
-        // _mm256_fmadd_ps(x, y, z) computes x*y + z without intermediate rounding
-        acc = _mm256_fmadd_ps(va, vb, acc);
-    }
-
-    // Horizontal reduce: sum 8 float lanes in the 256-bit register down to 1 scalar
-    //
-    // Step 1: split 256-bit into two 128-bit halves and add them pairwise
-    //   acc  = [a0 a1 a2 a3 | a4 a5 a6 a7]
-    //   lo   = [a0 a1 a2 a3]
-    //   hi   = [a4 a5 a6 a7]
-    //   s128 = [a0+a4, a1+a5, a2+a6, a3+a7]
-    __m128 lo   = _mm256_castps256_ps128(acc);       // lower 128 bits (zero-cost cast)
-    __m128 hi   = _mm256_extractf128_ps(acc, 1);     // upper 128 bits
-    __m128 s128 = _mm_add_ps(lo, hi);                // 4-lane pairwise add
-
-    // Step 2: two horizontal adds collapse 4 lanes → 2 → 1
-    //   hadd(x, x) = [x0+x1, x0+x1, x2+x3, x2+x3]
-    __m128 s2 = _mm_hadd_ps(s128, s128);
-    __m128 s1 = _mm_hadd_ps(s2,   s2);
-
-    return _mm_cvtss_f32(s1);  // extract lane 0 — the final scalar dot product
-}
-
-// simd_flat_search — exhaustive k-NN using SIMD dot products
-//
-// Drop-in replacement for flat_search; return type is identical.
-// The max-heap logic is unchanged — only the distance kernel is vectorized.
-std::priority_queue<std::pair<float, uint32_t>>
-simd_flat_search(float* base, float* query,
-                 size_t base_number, size_t vecdim, size_t k)
-{
-    std::priority_queue<std::pair<float, uint32_t>> q;
-
-    for (size_t i = 0; i < base_number; ++i) 
-    {
-        // Compute IP distance = 1 - dot(base_i, query) via AVX2
-        float dot = simd_inner_product(base + i * vecdim, query, vecdim);
-        float dis = 1.0f - dot;
-
-        if (q.size() < k) {
-            q.push({dis, (uint32_t)i});
-        } else if (dis < q.top().first) {
-            // New vector is closer than the current farthest; swap it in
-            q.push({dis, (uint32_t)i});
-            q.pop();
-        }
-    }
-    return q;
-}
 
 // LoadData<T> — reads a binary vector file into a flat array
 //
