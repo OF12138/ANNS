@@ -12,3 +12,5 @@ var/
 **.DS_Store
 *.pyc
 .claude/
+*.pdf
+

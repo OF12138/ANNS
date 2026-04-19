@@ -40,29 +40,36 @@
 //          is closer (dis < q.top().first), keeping only the k closest.
 //
 // Returns: max-heap of (distance, index) pairs for the k nearest neighbors.
-std::priority_queue<std::pair<float, uint32_t> > flat_search(float* base, float* query, size_t base_number, size_t vecdim, size_t k) {
+std::priority_queue<std::pair<float, uint32_t> > flat_search(float* base, float* query, size_t base_number, size_t vecdim, size_t k) 
+{
     // Max-heap: pair<distance, vector_index>. Top element is the farthest
     // among the current k candidates, enabling O(log k) replacement.
     std::priority_queue<std::pair<float, uint32_t> > q;
 
-    for(int i = 0; i < base_number; ++i) {
+    for(int i = 0; i < base_number; ++i) 
+    {
         float dis = 0;
 
         // DEEP100K数据集使用ip距离
         // Scalar dot product over vecdim dimensions.
         // base layout: row i starts at base + i*vecdim.
-        for(int d = 0; d < vecdim; ++d) {
+        for(int d = 0; d < vecdim; ++d) 
+        {
             dis += base[d + i*vecdim]*query[d];
         }
         // Convert similarity to distance: smaller value = closer neighbor.
         dis = 1 - dis;
 
-        if(q.size() < k) {
+        if(q.size() < k) 
+        {
             // Heap not full yet — always accept.
             q.push({dis, i});
-        } else {
+        } 
+        else 
+        {
             // Only replace the current farthest if this vector is closer.
-            if(dis < q.top().first) {
+            if(dis < q.top().first) 
+            {
                 q.push({dis, i});
                 q.pop();  // Remove the now-excess farthest element.
             }

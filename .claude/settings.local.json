@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Read(//e/Code/Parallel/**)",
-      "Bash(find . -maxdepth 3 -type d -name \"*ANNS*\" -o -name \"*anns*\")"
+      "Bash(find . -maxdepth 3 -type d -name \"*ANNS*\" -o -name \"*anns*\")",
+      "Bash(pip install *)",
+      "Bash(python3 -c \"import fitz; print\\('ok'\\)\")",
+      "Bash(pip3 install *)",
+      "Bash(where pdftotext *)",
+      "Bash(where mutool *)",
+      "Bash(where pdftk *)",
+      "Bash(python3 -m pip install pdfminer.six --quiet)",
+      "Bash(pdftotext *)"
     ]
   }
 }

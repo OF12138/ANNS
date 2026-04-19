@@ -60,7 +60,8 @@ T *LoadData(std::string data_path, size_t& n, size_t& d)
     fin.read((char*)&d,4);   // dimension per vector
     T* data = new T[n*d];
     int sz = sizeof(T);
-    for(int i = 0; i < n; ++i){
+    for(int i = 0; i < n; ++i)
+    {
         // Read each row independently so different T sizes work correctly.
         fin.read(((char*)data + i*d*sz), d*sz);
     }
@@ -166,14 +167,16 @@ int main(int argc, char *argv[])
 
         // Build a set of ground-truth IDs for query i (top-k from the gt file).
         std::set<uint32_t> gtset;
-        for(int j = 0; j < k; ++j){
+        for(int j = 0; j < k; ++j)
+        {
             int t = test_gt[j + i*test_gt_d];
             gtset.insert(t);
         }
 
         // Count how many of the returned k results appear in the ground truth.
         size_t acc = 0;
-        while (res.size()) {
+        while (res.size()) 
+        {
             int x = res.top().second;
             if(gtset.find(x) != gtset.end()){
                 ++acc;
@@ -188,7 +191,8 @@ int main(int argc, char *argv[])
 
     // Aggregate and print average recall and average latency.
     float avg_recall = 0, avg_latency = 0;
-    for(int i = 0; i < test_number; ++i) {
+    for(int i = 0; i < test_number; ++i) 
+    {
         avg_recall += results[i].recall;
         avg_latency += results[i].latency;
     }
