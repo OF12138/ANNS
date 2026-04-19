@@ -42,6 +42,7 @@
 #include <omp.h>
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "ARM/Alg_normal/flat_scan.h"
+#include "ARM/Alg_normal/flat_scan_normal.h"
 #include "ARM/Alg_parallel/flat_simd.h"  // NEON SIMD flat scan (active)
 
 using namespace hnswlib;
@@ -159,6 +160,8 @@ int main(int argc, char *argv[])
         // REPLACE THIS CALL with your optimized search function.
         // The return type (max-heap of <distance, index> pairs) must not change.
         auto res = simd_flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        //auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        //auto res = flat_search_normal(base, test_query + i*vecdim, base_number, vecdim, k);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);  // stop timer
