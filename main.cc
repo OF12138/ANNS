@@ -43,6 +43,7 @@
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "ARM/Alg_normal/flat_scan.h"
 #include "ARM/Alg_normal/flat_scan_normal.h"
+#include "ARM/Alg_normal/sq_flat_normal.h"   // SQ flat scan, scalar (no SIMD)
 #include "ARM/Alg_parallel/flat_simd.h"  // NEON SIMD flat scan (active)
 
 using namespace hnswlib;
@@ -145,6 +146,12 @@ int main(int argc, char *argv[])
     // 下面是一个构建hnsw索引的示例
     // build_index(base, base_number, vecdim);
 
+    // Build SQ index (offline, outside the timed loop)
+    // p controls the recall-latency tradeoff: larger p = better recall, higher latency.
+    const size_t sq_p = 200;  // top-p coarse candidates to rerank (tune for recall@10 ≥ 0.9)
+    SQIndex sq_index;
+    sq_index.build(base, base_number, vecdim);
+
 
     // -------------------------------------------------------------------------
     // Query loop — timed per query with gettimeofday (microsecond resolution)
@@ -159,7 +166,8 @@ int main(int argc, char *argv[])
         // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
         // REPLACE THIS CALL with your optimized search function.
         // The return type (max-heap of <distance, index> pairs) must not change.
-        auto res = simd_flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        auto res = sq_flat_search_normal(sq_index, base, test_query + i*vecdim, k, sq_p);
+        //auto res = simd_flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
         //auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
         //auto res = flat_search_normal(base, test_query + i*vecdim, base_number, vecdim, k);
 

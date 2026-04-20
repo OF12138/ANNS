@@ -31,19 +31,24 @@ flat_search_normal(float* base, float* query,
     // Max-heap of (distance, index): top = farthest current candidate
     std::priority_queue<std::pair<float, uint32_t>> q;
 
-    for (size_t i = 0; i < base_number; ++i) {
+    for (size_t i = 0; i < base_number; ++i) 
+    {
         float dis = 0.0f;
 
         // size_t counters produce 64-bit address arithmetic, which differs
         // from flat_scan.h's int counters and changes -O2 auto-vectorization.
-        for (size_t d = 0; d < vecdim; ++d) {
+        for (size_t d = 0; d < vecdim; ++d) 
+        {
             dis += base[d + i * vecdim] * query[d];
         }
         dis = 1.0f - dis;  // convert similarity → IP distance
 
-        if (q.size() < k) {
+        if (q.size() < k) 
+        {
             q.push({dis, (uint32_t)i});
-        } else if (dis < q.top().first) {
+        } 
+        else if (dis < q.top().first) 
+        {
             // Replace the farthest candidate with this closer vector
             q.push({dis, (uint32_t)i});
             q.pop();
