@@ -36,7 +36,8 @@
 #include <cmath>
 
 // SQIndex — stores per-dimension quantization parameters and uint8 codes
-struct SQIndex {
+struct SQIndex 
+{
     std::vector<uint8_t> codes;   // quantized base vectors, row-major [base_number × vecdim]
     std::vector<float>   mins;    // per-dimension minimum value [vecdim]
     std::vector<float>   scales;  // per-dimension scale = (max-min)/255  [vecdim]
@@ -45,7 +46,8 @@ struct SQIndex {
 
     // build — compute per-dimension min/scale and quantize all base vectors.
     // Must be called once before any search; takes O(n×d) time.
-    void build(const float* base, size_t n, size_t d) {
+    void build(const float* base, size_t n, size_t d) 
+    {
         base_number = n;
         vecdim      = d;
         mins.resize(d);
@@ -53,10 +55,12 @@ struct SQIndex {
         codes.resize(n * d);
 
         // Pass 1: find per-dimension [min, max]
-        for (size_t j = 0; j < d; ++j) {
+        for (size_t j = 0; j < d; ++j) 
+        {
             float mn =  std::numeric_limits<float>::max();
             float mx = -std::numeric_limits<float>::max();
-            for (size_t i = 0; i < n; ++i) {
+            for (size_t i = 0; i < n; ++i) 
+            {
                 float v = base[i * d + j];
                 if (v < mn) mn = v;
                 if (v > mx) mx = v;
@@ -67,8 +71,10 @@ struct SQIndex {
         }
 
         // Pass 2: quantize each dimension to uint8 via nearest-integer rounding
-        for (size_t i = 0; i < n; ++i) {
-            for (size_t j = 0; j < d; ++j) {
+        for (size_t i = 0; i < n; ++i) 
+        {
+            for (size_t j = 0; j < d; ++j) 
+            {
                 float v = (base[i * d + j] - mins[j]) / scales[j];
                 // Clamp to [0, 255] to guard against floating-point edge cases
                 if (v < 0.0f)   v = 0.0f;
