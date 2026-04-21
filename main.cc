@@ -44,6 +44,7 @@
 #include "ARM/Alg_normal/flat_scan.h"
 #include "ARM/Alg_normal/flat_scan_normal.h"
 #include "ARM/Alg_normal/sq_flat_normal.h"   // SQ flat scan, scalar (no SIMD)
+#include "ARM/Alg_normal/pq_flat_normal.h"   // PQ flat scan, scalar (no SIMD)
 #include "ARM/Alg_parallel/flat_simd.h"  // NEON SIMD flat scan (active)
 #include "ARM/Alg_parallel/sq_flat_simd.h"   // SQ flat scan, NEON SIMD (8-bit)
 
@@ -153,6 +154,11 @@ int main(int argc, char *argv[])
     SQIndex sq_index;
     sq_index.build(base, base_number, vecdim);
 
+    // Build PQ index (offline): M=8 subspaces, K=256 centroids, 25 k-means iterations
+    // Index size: base_number * M bytes (~800 KB for DEEP100K)
+    PQIndex pq_index;
+    pq_index.build(base, base_number, vecdim);
+
 
     // -------------------------------------------------------------------------
     // Query loop — timed per query with gettimeofday (microsecond resolution)
@@ -172,6 +178,8 @@ int main(int argc, char *argv[])
         //auto res = sq_flat_search_normal(sq_index, base, test_query + i*vecdim, k, sq_p);
         //auto res = simd_flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
         //auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        //auto res = pq_flat_search_rerank(pq_index, base, test_query + i*vecdim, k, sq_p);
+        //auto res = pq_flat_search_normal(pq_index, test_query + i*vecdim, k);
         //auto res = flat_search_normal(base, test_query + i*vecdim, base_number, vecdim, k);
 
         struct timeval newVal;
