@@ -112,7 +112,8 @@ sq_flat_search_normal(const SQIndex& index, const float* base,
     // -------------------------------------------------------------------------
     std::vector<float> adj_query(d);
     float offset = 0.0f;
-    for (size_t j = 0; j < d; ++j) {
+    for (size_t j = 0; j < d; ++j) 
+    {
         // adj_query[j] = scale[j] * query[j]: precompute so inner loop is just
         // uint8->float widening + FMA (no extra multiply by scale inside loop)
         adj_query[j] = index.scales[j] * query[j];
@@ -127,19 +128,24 @@ sq_flat_search_normal(const SQIndex& index, const float* base,
     // -------------------------------------------------------------------------
     std::priority_queue<std::pair<float, uint32_t>> coarse_heap;
 
-    for (size_t i = 0; i < index.base_number; ++i) {
+    for (size_t i = 0; i < index.base_number; ++i) 
+    {
         // Approximate IP distance = 1 - approx_dot
         float dot = offset;
         const uint8_t* code = index.codes.data() + i * d;
-        for (size_t j = 0; j < d; ++j) {
+        for (size_t j = 0; j < d; ++j) 
+        {
             // Cast uint8 to float before multiply — no integer overflow risk
             dot += static_cast<float>(code[j]) * adj_query[j];
         }
         float dis = 1.0f - dot;
 
-        if (coarse_heap.size() < p) {
+        if (coarse_heap.size() < p) 
+        {
             coarse_heap.push({dis, static_cast<uint32_t>(i)});
-        } else if (dis < coarse_heap.top().first) {
+        } 
+        else if (dis < coarse_heap.top().first) 
+        {
             // Replace the current worst candidate with this closer vector
             coarse_heap.push({dis, static_cast<uint32_t>(i)});
             coarse_heap.pop();
@@ -163,7 +169,8 @@ sq_flat_search_normal(const SQIndex& index, const float* base,
     // -------------------------------------------------------------------------
     std::priority_queue<std::pair<float, uint32_t>> result;
 
-    for (uint32_t id : cand_ids) {
+    for (uint32_t id : cand_ids) 
+    {
         // Exact float32 inner product (same formula as flat_search_normal)
         float dot = 0.0f;
         const float* bv = base + static_cast<size_t>(id) * d;
@@ -174,7 +181,8 @@ sq_flat_search_normal(const SQIndex& index, const float* base,
 
         if (result.size() < k) {
             result.push({dis, id});
-        } else if (dis < result.top().first) {
+        } else if (dis < result.top().first) 
+        {
             result.push({dis, id});
             result.pop();
         }

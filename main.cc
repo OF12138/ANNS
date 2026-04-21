@@ -168,6 +168,7 @@ int main(int argc, char *argv[])
         // REPLACE THIS CALL with your optimized search function.
         // The return type (max-heap of <distance, index> pairs) must not change.
         auto res = sq_flat_search_simd(sq_index, base, test_query + i*vecdim, k, sq_p);
+        //auto res = sq_flat_search_sdc(sq_index, base, test_query + i*vecdim, k, sq_p);
         //auto res = sq_flat_search_normal(sq_index, base, test_query + i*vecdim, k, sq_p);
         //auto res = simd_flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
         //auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);

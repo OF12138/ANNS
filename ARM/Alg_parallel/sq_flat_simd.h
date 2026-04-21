@@ -73,7 +73,8 @@ inline float sq_rerank_dot_simd(const float* a, const float* b, size_t dim)
     float32x4_t s1 = vdupq_n_f32(0.0f);
     float32x4_t s2 = vdupq_n_f32(0.0f);
     float32x4_t s3 = vdupq_n_f32(0.0f);
-    for (size_t j = 0; j < dim; j += 16) {
+    for (size_t j = 0; j < dim; j += 16) 
+    {
         s0 = vmlaq_f32(s0, vld1q_f32(a + j),      vld1q_f32(b + j));
         s1 = vmlaq_f32(s1, vld1q_f32(a + j +  4), vld1q_f32(b + j +  4));
         s2 = vmlaq_f32(s2, vld1q_f32(a + j +  8), vld1q_f32(b + j +  8));
@@ -131,6 +132,116 @@ sq_flat_search_simd(const SQIndex& index, const float* base,
     // ---- Phase 2: exact rerank on float32 base vectors -----------------------
     std::priority_queue<std::pair<float, uint32_t>> result;
     for (uint32_t id : cand_ids) {
+        float dot = sq_rerank_dot_simd(base + static_cast<size_t>(id) * d, query, d);
+        float dis = 1.0f - dot;
+
+        if (result.size() < k) {
+            result.push({dis, id});
+        } else if (dis < result.top().first) {
+            result.push({dis, id});
+            result.pop();
+        }
+    }
+    return result;
+}
+
+// =============================================================================
+// SDC (Symmetric Distance Computation) variant
+//
+// The query is quantized to uint8 using the same per-dimension min/scale as
+// the base index.  The coarse scan then computes an integer dot product:
+//   idot = Σ base_code[j] * qcode[j]   (uint8 × uint8 → uint32)
+// which approximates the relative IP ranking without any float multiply in
+// the inner loop.
+//
+// NEON kernel: vmull_u8 → 8 uint16 products per call (two calls = 16 muls per
+// 16-byte load).  uint16 results are widened to uint32 via vmovl_u16 before
+// accumulation to avoid overflow (max lane after dim=96: 6×65025 = 390K < 4G).
+// Four independent uint32x4 accumulators break the dependency chain.
+//
+// The integer dot is negated so the existing max-heap naturally retains the
+// p candidates with the HIGHEST integer dot (= best approximate IP).
+// Rerank phase is identical to sq_flat_search_simd.
+// =============================================================================
+
+// Quantize a float32 query into uint8 codes using the SQIndex per-dim min/scale.
+inline void sq_quantize_query(const SQIndex& index, const float* query,
+                               uint8_t* qcodes)
+{
+    const size_t d = index.vecdim;
+    for (size_t j = 0; j < d; ++j) 
+    {
+        int q = (int)((query[j] - index.mins[j]) / index.scales[j] + 0.5f);
+        if (q < 0)   q = 0;
+        if (q > 255) q = 255;
+        qcodes[j] = (uint8_t)q;
+    }
+}
+
+// sdc_coarse_dot_simd — integer dot product uint8×uint8 → uint32 via NEON
+// Processes 16 code pairs per iteration (vmull_u8 ×2, then vmovl_u16 ×4).
+inline float sdc_coarse_dot_simd(const uint8_t* base_code, const uint8_t* qcode, size_t dim)
+{
+    uint32x4_t sum0 = vdupq_n_u32(0);
+    uint32x4_t sum1 = vdupq_n_u32(0);
+    uint32x4_t sum2 = vdupq_n_u32(0);
+    uint32x4_t sum3 = vdupq_n_u32(0);
+
+    for (size_t j = 0; j < dim; j += 16) 
+    {
+        uint8x16_t a = vld1q_u8(base_code + j);
+        uint8x16_t b = vld1q_u8(qcode + j);
+
+        uint16x8_t p_lo = vmull_u8(vget_low_u8(a),  vget_low_u8(b));   // codes 0..7
+        uint16x8_t p_hi = vmull_u8(vget_high_u8(a), vget_high_u8(b));  // codes 8..15
+
+        sum0 = vaddq_u32(sum0, vmovl_u16(vget_low_u16(p_lo)));
+        sum1 = vaddq_u32(sum1, vmovl_u16(vget_high_u16(p_lo)));
+        sum2 = vaddq_u32(sum2, vmovl_u16(vget_low_u16(p_hi)));
+        sum3 = vaddq_u32(sum3, vmovl_u16(vget_high_u16(p_hi)));
+    }
+
+    sum0 = vaddq_u32(sum0, sum1);
+    sum2 = vaddq_u32(sum2, sum3);
+    return (float)vaddvq_u32(vaddq_u32(sum0, sum2));
+}
+
+// sq_flat_search_sdc — two-phase SQ k-NN with SDC integer coarse scan
+inline std::priority_queue<std::pair<float, uint32_t>>
+sq_flat_search_sdc(const SQIndex& index, const float* base,
+                   const float* query, size_t k, size_t p)
+{
+    const size_t d = index.vecdim;
+
+    std::vector<uint8_t> qcodes(d);
+    sq_quantize_query(index, query, qcodes.data());
+
+    // Phase 1: integer coarse scan — negate idot so max-heap keeps top-p by highest IP
+    std::priority_queue<std::pair<float, uint32_t>> coarse_heap;
+    for (size_t i = 0; i < index.base_number; ++i) 
+    {
+        float neg_idot = -sdc_coarse_dot_simd(
+            index.codes.data() + i * d, qcodes.data(), d);
+
+        if (coarse_heap.size() < p) {
+            coarse_heap.push({neg_idot, static_cast<uint32_t>(i)});
+        } else if (neg_idot < coarse_heap.top().first) {
+            coarse_heap.push({neg_idot, static_cast<uint32_t>(i)});
+            coarse_heap.pop();
+        }
+    }
+
+    std::vector<uint32_t> cand_ids;
+    cand_ids.reserve(p);
+    while (!coarse_heap.empty()) {
+        cand_ids.push_back(coarse_heap.top().second);
+        coarse_heap.pop();
+    }
+
+    // Phase 2: exact float32 rerank (identical to sq_flat_search_simd)
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (uint32_t id : cand_ids) 
+    {
         float dot = sq_rerank_dot_simd(base + static_cast<size_t>(id) * d, query, d);
         float dis = 1.0f - dot;
 
