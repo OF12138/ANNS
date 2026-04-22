@@ -47,6 +47,7 @@
 #include "ARM/Alg_normal/pq_flat_normal.h"   // PQ flat scan, scalar (no SIMD)
 #include "ARM/Alg_parallel/flat_simd.h"  // NEON SIMD flat scan (active)
 #include "ARM/Alg_parallel/sq_flat_simd.h"   // SQ flat scan, NEON SIMD (8-bit)
+#include "ARM/Alg_parallel/pq_flat_simd.h"   // PQ flat scan, NEON SIMD (LUT flat + cross-centroid)
 
 using namespace hnswlib;
 
@@ -155,9 +156,14 @@ int main(int argc, char *argv[])
     sq_index.build(base, base_number, vecdim);
 
     // Build PQ index (offline): M=8 subspaces, K=256 centroids, 25 k-means iterations
-    // Index size: base_number * M bytes (~800 KB for DEEP100K)
+    // Use SIMD-accelerated k-means (pq_build_index_simd) or scalar (pq_index.build).
     PQIndex pq_index;
-    pq_index.build(base, base_number, vecdim);
+    pq_build_index_simd(pq_index, base, base_number, vecdim);
+    // pq_build_index_simd_blocked(pq_index, base, base_number, vecdim);  // true i×k double-tiled blocking
+    // pq_index.build(base, base_number, vecdim);  // scalar baseline
+
+    // Precompute transposed centroid layout for cross-centroid SIMD LUT build
+    PQIndexSIMD pq_simd(pq_index);
 
 
     // -------------------------------------------------------------------------
@@ -178,6 +184,9 @@ int main(int argc, char *argv[])
         //auto res = sq_flat_search_normal(sq_index, base, test_query + i*vecdim, k, sq_p);
         //auto res = simd_flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
         //auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        //auto res = pq_flat_search_rerank_cc_unroll(pq_simd, base, test_query + i*vecdim, k, sq_p);
+        //auto res = pq_flat_search_rerank_cross_centroid_simd(pq_simd, base, test_query + i*vecdim, k, sq_p);
+        //auto res = pq_flat_search_rerank_flat_simd(pq_index, base, test_query + i*vecdim, k, sq_p);
         //auto res = pq_flat_search_rerank(pq_index, base, test_query + i*vecdim, k, sq_p);
         //auto res = pq_flat_search_normal(pq_index, test_query + i*vecdim, k);
         //auto res = flat_search_normal(base, test_query + i*vecdim, base_number, vecdim, k);
