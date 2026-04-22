@@ -242,6 +242,45 @@ int main(int argc, char *argv[])
 #endif
 #endif
 
+    // ── LUT build phase timing ────────────────────────────────────────────────
+    // Runs a LUT-build-only loop BEFORE the main timed loop.
+    // The reported average latency below is NOT affected by this.
+#if SEARCH_ALG >= PQ_RERANK
+    double avg_lut_us = 0.0;
+    {
+        std::vector<float> dtable_tmp(pq_index.M * pq_index.K);
+        double sum_lut = 0.0;
+        for (int i = 0; i < (int)test_number; ++i) {
+            const float* q = test_query + i * vecdim;
+            struct timeval la, lb;
+            gettimeofday(&la, NULL);
+#if   SEARCH_ALG == PQ_RERANK
+            for (size_t m = 0; m < pq_index.M; ++m) {
+                const float* q_m    = q + m * pq_index.dsub;
+                const float* c_base = pq_index.centroids.data() + m * pq_index.K * pq_index.dsub;
+                for (size_t c = 0; c < pq_index.K; ++c) {
+                    const float* cv = c_base + c * pq_index.dsub;
+                    float ip = 0.0f;
+                    for (size_t j = 0; j < pq_index.dsub; ++j) ip += q_m[j] * cv[j];
+                    dtable_tmp[m * pq_index.K + c] = ip;
+                }
+            }
+#elif SEARCH_ALG == PQ_FLAT_SIMD
+            pq_build_lut_flat_simd(pq_index, q, dtable_tmp.data());
+#elif SEARCH_ALG == PQ_CC_SIMD
+            pq_build_lut_cross_centroid_simd(pq_simd, q, dtable_tmp.data());
+#elif SEARCH_ALG == PQ_CC_UNROLL
+            pq_build_lut_cc_unroll(pq_simd, q, dtable_tmp.data());
+#endif
+            gettimeofday(&lb, NULL);
+            sum_lut += tv_diff_us(la, lb);
+        }
+        avg_lut_us = sum_lut / test_number;
+    }
+    std::cerr << std::fixed << std::setprecision(2);
+    std::cerr << "[phase] avg LUT build:   " << avg_lut_us << " us\n";
+#endif
+
     // ── Query loop ────────────────────────────────────────────────────────────
     for(int i = 0; i < (int)test_number; ++i)
     {
@@ -302,5 +341,17 @@ int main(int argc, char *argv[])
     // 浮点误差可能导致一些精确算法平均recall不是1
     std::cout << "average recall: "       << avg_recall  / test_number << "\n";
     std::cout << "average latency (us): " << avg_latency / test_number << "\n";
+#if SEARCH_ALG >= PQ_RERANK
+    {
+        double avg_total      = (double)avg_latency / test_number;
+        double scan_rerank_us = avg_total - avg_lut_us;
+        std::cerr << "[phase] avg scan+rerank: " << scan_rerank_us << " us\n";
+        std::cerr << "[phase] avg total:       " << avg_total      << " us\n";
+        std::cerr << "[phase] lut%="
+                  << (avg_lut_us       / avg_total * 100.0) << "  "
+                  << "scan+rerank%="
+                  << (scan_rerank_us   / avg_total * 100.0) << "\n";
+    }
+#endif
     return 0;
 }
