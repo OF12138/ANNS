@@ -29,6 +29,59 @@
 //   [n × d × sizeof(T) bytes: row-major vector data]
 // =============================================================================
 
+// =============================================================================
+//  EXPERIMENT CONFIGURATION — change SEARCH_ALG and BUILD_PQ, then recompile.
+//
+//  SEARCH_ALG values:
+//   ── Exact flat scan ──────────────────────────────────────────────────────
+//    1  FLAT_SCALAR      flat_search()                scalar, int loop, exact
+//    2  FLAT_NORMAL      flat_search_normal()         scalar, size_t loop, exact
+//    3  FLAT_SIMD        simd_flat_search()           NEON float32x4 1-acc, exact
+//    4  FLAT_SIMD_UNROLL simd_flat_search_unroll()    NEON float32x4 4-acc, exact
+//   ── Scalar Quantization (2-phase, coarse p candidates → exact rerank) ───
+//    5  SQ_NORMAL        sq_flat_search_normal()      scalar ADC coarse + scalar rerank
+//    6  SQ_SIMD          sq_flat_search_simd()        NEON ADC coarse (uint8→float) + NEON rerank
+//    7  SQ_SDC           sq_flat_search_sdc()         NEON SDC coarse (vmull_u8 integer) + NEON rerank
+//   ── Product Quantization (2-phase, coarse p candidates → exact rerank) ──
+//    8  PQ_NORMAL        pq_flat_search_normal()      scalar ADC scan, no rerank
+//    9  PQ_RERANK        pq_flat_search_rerank()      scalar ADC scan + scalar float rerank
+//   10  PQ_FLAT_SIMD     pq_flat_search_rerank_flat_simd()          flat-SIMD LUT (1 acc/centroid)
+//   11  PQ_CC_SIMD       pq_flat_search_rerank_cross_centroid_simd() CC-SIMD LUT (0 reductions)
+//   12  PQ_CC_UNROLL     pq_flat_search_rerank_cc_unroll()           CC-SIMD LUT + 4× unroll
+//
+//  BUILD_PQ values (only used when SEARCH_ALG is 8–12; ignored otherwise):
+//    1  PQ_BUILD_SCALAR        pq_index.build()                 scalar k-means
+//    2  PQ_BUILD_SIMD          pq_build_index_simd()            SIMD cross-centroid + k-tiled
+//    3  PQ_BUILD_SIMD_BLOCKED  pq_build_index_simd_blocked()    SIMD double-tiled (i_blk × k_blk)
+// =============================================================================
+#define FLAT_SCALAR            1
+#define FLAT_NORMAL            2
+#define FLAT_SIMD              3
+#define FLAT_SIMD_UNROLL       4
+#define SQ_NORMAL              5
+#define SQ_SIMD                6
+#define SQ_SDC                 7
+#define PQ_NORMAL              8
+#define PQ_RERANK              9
+#define PQ_FLAT_SIMD          10
+#define PQ_CC_SIMD            11
+#define PQ_CC_UNROLL          12
+
+#define PQ_BUILD_SCALAR        1
+#define PQ_BUILD_SIMD          2
+#define PQ_BUILD_SIMD_BLOCKED  3
+
+// ── SET YOUR EXPERIMENT HERE ─────────────────────────────────────────────────
+#define SEARCH_ALG   SQ_SIMD
+#define BUILD_PQ     PQ_BUILD_SIMD
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Coarse candidate count for SQ/PQ rerank (SEARCH_ALG 5–12).
+// Larger p → higher recall, higher latency.
+static const size_t p = 200;
+
+// =============================================================================
+
 #include <vector>
 #include <cstring>
 #include <string>
@@ -43,11 +96,11 @@
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "ARM/Alg_normal/flat_scan.h"
 #include "ARM/Alg_normal/flat_scan_normal.h"
-#include "ARM/Alg_normal/sq_flat_normal.h"   // SQ flat scan, scalar (no SIMD)
-#include "ARM/Alg_normal/pq_flat_normal.h"   // PQ flat scan, scalar (no SIMD)
-#include "ARM/Alg_parallel/flat_simd.h"  // NEON SIMD flat scan (active)
-#include "ARM/Alg_parallel/sq_flat_simd.h"   // SQ flat scan, NEON SIMD (8-bit)
-#include "ARM/Alg_parallel/pq_flat_simd.h"   // PQ flat scan, NEON SIMD (LUT flat + cross-centroid)
+#include "ARM/Alg_normal/sq_flat_normal.h"
+#include "ARM/Alg_normal/pq_flat_normal.h"
+#include "ARM/Alg_parallel/flat_simd.h"
+#include "ARM/Alg_parallel/sq_flat_simd.h"
+#include "ARM/Alg_parallel/pq_flat_simd.h"
 
 using namespace hnswlib;
 
@@ -61,15 +114,12 @@ T *LoadData(std::string data_path, size_t& n, size_t& d)
 {
     std::ifstream fin;
     fin.open(data_path, std::ios::in | std::ios::binary);
-    fin.read((char*)&n,4);   // number of vectors
-    fin.read((char*)&d,4);   // dimension per vector
+    fin.read((char*)&n,4);
+    fin.read((char*)&d,4);
     T* data = new T[n*d];
     int sz = sizeof(T);
     for(int i = 0; i < n; ++i)
-    {
-        // Read each row independently so different T sizes work correctly.
         fin.read(((char*)data + i*d*sz), d*sz);
-    }
     fin.close();
 
     std::cerr<<"load data "<<data_path<<"\n";
@@ -82,154 +132,180 @@ T *LoadData(std::string data_path, size_t& n, size_t& d)
 struct SearchResult
 {
     float recall;
-    int64_t latency; // 单位us
+    int64_t latency; // microseconds
 };
 
 // build_index — constructs and persists an HNSW index (example, disabled by default)
-//
-// Parameters:
-//   base        : base dataset, row-major [base_number × vecdim]
-//   base_number : number of vectors
-//   vecdim      : vector dimension
-//
-// HNSW hyperparameters:
-//   efConstruction (150): search width during index build. Higher = better
-//     recall at the cost of longer build time. Keep ≤ 200 for this dataset.
-//   M (16): max number of bidirectional links per node per layer. Higher =
-//     better recall / faster search but larger memory footprint. Keep ≤ 16.
-//
-// The first vector (index 0) must be added outside the parallel region because
-// it sets the HNSW entry point; all subsequent vectors can be added in parallel.
 void build_index(float* base, size_t base_number, size_t vecdim)
 {
-    const int efConstruction = 150; // 为防止索引构建时间过长，efc建议设置200以下
-    const int M = 16; // M建议设置为16以下
+    const int efConstruction = 150;
+    const int M = 16;
 
     HierarchicalNSW<float> *appr_alg;
     InnerProductSpace ipspace(vecdim);
-    // Construct empty HNSW graph with capacity base_number.
     appr_alg = new HierarchicalNSW<float>(&ipspace, base_number, M, efConstruction);
 
-    // Insert vector 0 serially to establish the graph entry point.
     appr_alg->addPoint(base, 0);
-    // Insert remaining vectors in parallel; hnswlib is thread-safe for addPoint.
     #pragma omp parallel for
-    for(int i = 1; i < base_number; ++i) {
+    for(int i = 1; i < base_number; ++i)
         appr_alg->addPoint(base + 1ll*vecdim*i, i);
-    }
 
     char path_index[1024] = "files/hnsw.index";
     appr_alg->saveIndex(path_index);
 }
 
+// Returns elapsed microseconds between two gettimeofday snapshots.
+static inline int64_t tv_diff_us(const struct timeval& a, const struct timeval& b)
+{
+    return (b.tv_sec * 1000000LL + b.tv_usec) - (a.tv_sec * 1000000LL + a.tv_usec);
+}
 
 int main(int argc, char *argv[])
 {
+    // ── Print experiment configuration ───────────────────────────────────────
+    // These names mirror the comment table above; shown in PBS stdout for easy
+    // identification when comparing multiple job outputs.
+    static const char* search_names[] = 
+    {
+        "",
+        "flat_search (scalar exact)",                                    //  1
+        "flat_search_normal (scalar exact, size_t)",                     //  2
+        "simd_flat_search (NEON 1-acc exact)",                           //  3
+        "simd_flat_search_unroll (NEON 4-acc exact)",                    //  4
+        "sq_flat_search_normal (SQ scalar ADC)",                         //  5
+        "sq_flat_search_simd (SQ NEON ADC float)",                       //  6
+        "sq_flat_search_sdc (SQ NEON SDC integer)",                      //  7
+        "pq_flat_search_normal (PQ scalar ADC no-rerank)",               //  8
+        "pq_flat_search_rerank (PQ scalar ADC + rerank)",                //  9
+        "pq_flat_search_rerank_flat_simd (PQ flat-SIMD LUT)",            // 10
+        "pq_flat_search_rerank_cross_centroid_simd (PQ CC-SIMD LUT)",    // 11
+        "pq_flat_search_rerank_cc_unroll (PQ CC-SIMD 4x-unroll LUT)",   // 12
+    };
+    static const char* build_names[] = {
+        "",
+        "pq_index.build (scalar k-means)",                               //  1
+        "pq_build_index_simd (SIMD k-tiled)",                            //  2
+        "pq_build_index_simd_blocked (SIMD double-tiled)",               //  3
+    };
+
+    std::cout << "========================================\n";
+    std::cout << "[config] search_alg = " << SEARCH_ALG
+              << "  " << search_names[SEARCH_ALG] << "\n";
+#if SEARCH_ALG >= PQ_NORMAL
+    std::cout << "[config] build_pq   = " << BUILD_PQ
+              << "  " << build_names[BUILD_PQ] << "\n";
+#endif
+    std::cout << "[config] p=" << p << "  k=10\n";
+    std::cout << "========================================\n";
+
+    // ── Load dataset ─────────────────────────────────────────────────────────
     size_t test_number = 0, base_number = 0;
     size_t test_gt_d = 0, vecdim = 0;
 
-    // Load all three dataset files. LoadData infers n and d from the file header.
     std::string data_path = "/anndata/";
-    auto test_query = LoadData<float>(data_path + "DEEP100K.query.fbin", test_number, vecdim);
-    // Ground-truth: for query i, the top-k labels are at test_gt[i*test_gt_d .. i*test_gt_d+k-1].
-    auto test_gt = LoadData<int>(data_path + "DEEP100K.gt.query.100k.top100.bin", test_number, test_gt_d);
-    auto base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin", base_number, vecdim);
-    // 只测试前2000条查询
+    auto test_query = LoadData<float>(data_path + "DEEP100K.query.fbin",              test_number, vecdim);
+    auto test_gt    = LoadData<int>  (data_path + "DEEP100K.gt.query.100k.top100.bin",test_number, test_gt_d);
+    auto base       = LoadData<float>(data_path + "DEEP100K.base.100k.fbin",          base_number, vecdim);
     test_number = 2000;
 
-    const size_t k = 10;  // Number of nearest neighbors to retrieve.
+    const size_t k = 10;
 
-    std::vector<SearchResult> results;
-    results.resize(test_number);
+    std::vector<SearchResult> results(test_number);
 
-    // 如果你需要保存索引，可以在这里添加你需要的函数，你可以将下面的注释删除来查看pbs是否将build.index返回到你的files目录中
-    // 要保存的目录必须是files/*
-    // 每个人的目录空间有限，不需要的索引请及时删除，避免占空间太大
-    // 不建议在正式测试查询时同时构建索引，否则性能波动会较大
-    // 下面是一个构建hnsw索引的示例
-    // build_index(base, base_number, vecdim);
+    // ── Index build (only constructs what SEARCH_ALG requires) ───────────────
+    // Build time is printed to stderr so it appears in the PBS job's stderr
+    // file separately from the recall/latency output in stdout.
+    struct timeval tb0, tb1;
 
-    // Build SQ index (offline, outside the timed loop)
-    // p controls the recall-latency tradeoff: larger p = better recall, higher latency.
-    const size_t sq_p = 200;  // top-p coarse candidates to rerank (tune for recall@10 ≥ 0.9)
+#if SEARCH_ALG >= SQ_NORMAL && SEARCH_ALG <= SQ_SDC
     SQIndex sq_index;
+    gettimeofday(&tb0, NULL);
     sq_index.build(base, base_number, vecdim);
+    gettimeofday(&tb1, NULL);
+    std::cerr << "[build] SQIndex: " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+#endif
 
-    // Build PQ index (offline): M=8 subspaces, K=256 centroids, 25 k-means iterations
-    // Use SIMD-accelerated k-means (pq_build_index_simd) or scalar (pq_index.build).
+#if SEARCH_ALG >= PQ_NORMAL
     PQIndex pq_index;
+    gettimeofday(&tb0, NULL);
+#if   BUILD_PQ == PQ_BUILD_SCALAR
+    pq_index.build(base, base_number, vecdim);
+#elif BUILD_PQ == PQ_BUILD_SIMD
     pq_build_index_simd(pq_index, base, base_number, vecdim);
-    // pq_build_index_simd_blocked(pq_index, base, base_number, vecdim);  // true i×k double-tiled blocking
-    // pq_index.build(base, base_number, vecdim);  // scalar baseline
+#elif BUILD_PQ == PQ_BUILD_SIMD_BLOCKED
+    pq_build_index_simd_blocked(pq_index, base, base_number, vecdim);
+#else
+    #error "Unknown BUILD_PQ value. Use PQ_BUILD_SCALAR, PQ_BUILD_SIMD, or PQ_BUILD_SIMD_BLOCKED."
+#endif
+    gettimeofday(&tb1, NULL);
+    std::cerr << "[build] PQIndex (build_pq=" << BUILD_PQ << "): "
+              << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 
-    // Precompute transposed centroid layout for cross-centroid SIMD LUT build
+    // Transposed centroid layout — only needed by CC-SIMD variants (11, 12)
+#if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL
     PQIndexSIMD pq_simd(pq_index);
+#endif
+#endif
 
-
-    // -------------------------------------------------------------------------
-    // Query loop — timed per query with gettimeofday (microsecond resolution)
-    // -------------------------------------------------------------------------
-    for(int i = 0; i < test_number; ++i)
+    // ── Query loop ────────────────────────────────────────────────────────────
+    for(int i = 0; i < (int)test_number; ++i)
     {
-        const unsigned long Converter = 1000 * 1000;  // seconds → microseconds
-        struct timeval val;
-        int ret = gettimeofday(&val, NULL);  // start timer
+        struct timeval val, newVal;
+        gettimeofday(&val, NULL);
 
-        // 该文件已有代码中你只能修改该函数的调用方式
-        // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        // REPLACE THIS CALL with your optimized search function.
-        // The return type (max-heap of <distance, index> pairs) must not change.
-        auto res = sq_flat_search_simd(sq_index, base, test_query + i*vecdim, k, sq_p);
-        //auto res = sq_flat_search_sdc(sq_index, base, test_query + i*vecdim, k, sq_p);
-        //auto res = sq_flat_search_normal(sq_index, base, test_query + i*vecdim, k, sq_p);
-        //auto res = simd_flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
-        //auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
-        //auto res = pq_flat_search_rerank_cc_unroll(pq_simd, base, test_query + i*vecdim, k, sq_p);
-        //auto res = pq_flat_search_rerank_cross_centroid_simd(pq_simd, base, test_query + i*vecdim, k, sq_p);
-        //auto res = pq_flat_search_rerank_flat_simd(pq_index, base, test_query + i*vecdim, k, sq_p);
-        //auto res = pq_flat_search_rerank(pq_index, base, test_query + i*vecdim, k, sq_p);
-        //auto res = pq_flat_search_normal(pq_index, test_query + i*vecdim, k);
-        //auto res = flat_search_normal(base, test_query + i*vecdim, base_number, vecdim, k);
+#if   SEARCH_ALG == FLAT_SCALAR
+        auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+#elif SEARCH_ALG == FLAT_NORMAL
+        auto res = flat_search_normal(base, test_query + i*vecdim, base_number, vecdim, k);
+#elif SEARCH_ALG == FLAT_SIMD
+        auto res = simd_flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+#elif SEARCH_ALG == FLAT_SIMD_UNROLL
+        auto res = simd_flat_search_unroll(base, test_query + i*vecdim, base_number, vecdim, k);
+#elif SEARCH_ALG == SQ_NORMAL
+        auto res = sq_flat_search_normal(sq_index, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == SQ_SIMD
+        auto res = sq_flat_search_simd(sq_index, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == SQ_SDC
+        auto res = sq_flat_search_sdc(sq_index, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == PQ_NORMAL
+        auto res = pq_flat_search_normal(pq_index, test_query + i*vecdim, k);
+#elif SEARCH_ALG == PQ_RERANK
+        auto res = pq_flat_search_rerank(pq_index, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == PQ_FLAT_SIMD
+        auto res = pq_flat_search_rerank_flat_simd(pq_index, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == PQ_CC_SIMD
+        auto res = pq_flat_search_rerank_cross_centroid_simd(pq_simd, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == PQ_CC_UNROLL
+        auto res = pq_flat_search_rerank_cc_unroll(pq_simd, base, test_query + i*vecdim, k, p);
+#else
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–12)."
+#endif
 
-        struct timeval newVal;
-        ret = gettimeofday(&newVal, NULL);  // stop timer
-        // Compute elapsed time in microseconds.
-        int64_t diff = (newVal.tv_sec * Converter + newVal.tv_usec) - (val.tv_sec * Converter + val.tv_usec);
+        gettimeofday(&newVal, NULL);
+        int64_t diff = tv_diff_us(val, newVal);
 
-        // Build a set of ground-truth IDs for query i (top-k from the gt file).
         std::set<uint32_t> gtset;
-        for(int j = 0; j < k; ++j)
-        {
-            int t = test_gt[j + i*test_gt_d];
-            gtset.insert(t);
-        }
+        for(int j = 0; j < (int)k; ++j)
+            gtset.insert(test_gt[j + i*test_gt_d]);
 
-        // Count how many of the returned k results appear in the ground truth.
         size_t acc = 0;
-        while (res.size()) 
+        while (res.size())
         {
-            int x = res.top().second;
-            if(gtset.find(x) != gtset.end()){
-                ++acc;
-            }
+            if(gtset.count(res.top().second)) ++acc;
             res.pop();
         }
-        // Recall@k = (# returned results that are true neighbors) / k
-        float recall = (float)acc/k;
-
-        results[i] = {recall, diff};
+        results[i] = {(float)acc / k, diff};
     }
 
-    // Aggregate and print average recall and average latency.
+    // ── Report ────────────────────────────────────────────────────────────────
     float avg_recall = 0, avg_latency = 0;
-    for(int i = 0; i < test_number; ++i) 
+    for(int i = 0; i < (int)test_number; ++i)
     {
-        avg_recall += results[i].recall;
+        avg_recall  += results[i].recall;
         avg_latency += results[i].latency;
     }
-
     // 浮点误差可能导致一些精确算法平均recall不是1
-    std::cout << "average recall: "<<avg_recall / test_number<<"\n";
-    std::cout << "average latency (us): "<<avg_latency / test_number<<"\n";
+    std::cout << "average recall: "       << avg_recall  / test_number << "\n";
+    std::cout << "average latency (us): " << avg_latency / test_number << "\n";
     return 0;
 }
