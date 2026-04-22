@@ -164,15 +164,19 @@ pq_rerank_from_dtable(const PQIndex& index, const float* base,
     const size_t d = index.vecdim;
 
     std::priority_queue<std::pair<float, uint32_t>> coarse_heap;
-    for (size_t i = 0; i < index.base_number; ++i) {
+    for (size_t i = 0; i < index.base_number; ++i) 
+    {
         const uint8_t* code = index.codes.data() + i * M;
         float approx_ip = 0.0f;
         for (size_t m = 0; m < M; ++m) approx_ip += dtable[m * K + code[m]];
         float dis = 1.0f - approx_ip;
 
-        if (coarse_heap.size() < p) {
+        if (coarse_heap.size() < p) 
+        {
             coarse_heap.push({dis, static_cast<uint32_t>(i)});
-        } else if (dis < coarse_heap.top().first) {
+        } 
+        else if (dis < coarse_heap.top().first) 
+        {
             coarse_heap.push({dis, static_cast<uint32_t>(i)});
             coarse_heap.pop();
         }
