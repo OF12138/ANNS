@@ -76,10 +76,6 @@
 #define BUILD_PQ     PQ_BUILD_SIMD
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Coarse candidate count for SQ/PQ rerank (SEARCH_ALG 5–12).
-// Larger p → higher recall, higher latency.
-static const size_t p = 200;
-
 // =============================================================================
 
 #include <vector>
@@ -103,6 +99,10 @@ static const size_t p = 200;
 #include "ARM/Alg_parallel/pq_flat_simd.h"
 
 using namespace hnswlib;
+
+// Coarse candidate count for SQ/PQ rerank (SEARCH_ALG 5–12).
+// Larger p → higher recall, higher latency.
+static const size_t p = 200;
 
 // LoadData<T> — reads a binary vector file into a flat array
 //
