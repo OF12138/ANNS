@@ -50,9 +50,8 @@
 //   12  PQ_CC_UNROLL     pq_flat_search_rerank_cc_unroll()           CC-SIMD LUT + 4× unroll
 //
 //  BUILD_PQ values (only used when SEARCH_ALG is 8–12; ignored otherwise):
-//    1  PQ_BUILD_SCALAR        pq_index.build()                 scalar k-means
-//    2  PQ_BUILD_SIMD          pq_build_index_simd()            SIMD cross-centroid + k-tiled
-//    3  PQ_BUILD_SIMD_BLOCKED  pq_build_index_simd_blocked()    SIMD double-tiled (i_blk × k_blk)
+//    1  PQ_BUILD_SCALAR   pq_index.build()                scalar k-means
+//    2  PQ_BUILD_SIMD     pq_build_index_simd_blocked()   SIMD double-tiled (i_blk × k_blk)
 // =============================================================================
 #define FLAT_SCALAR            1
 #define FLAT_NORMAL            2
@@ -69,7 +68,6 @@
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
-#define PQ_BUILD_SIMD_BLOCKED  3
 
 // ── SET YOUR EXPERIMENT HERE ─────────────────────────────────────────────────
 #define SEARCH_ALG   SQ_SIMD
@@ -184,8 +182,7 @@ int main(int argc, char *argv[])
     static const char* build_names[] = {
         "",
         "pq_index.build (scalar k-means)",                               //  1
-        "pq_build_index_simd (SIMD k-tiled)",                            //  2
-        "pq_build_index_simd_blocked (SIMD double-tiled)",               //  3
+        "pq_build_index_simd_blocked (SIMD double-tiled i×k)",           //  2
     };
 
     std::cerr << "========================================\n";
@@ -231,11 +228,9 @@ int main(int argc, char *argv[])
 #if   BUILD_PQ == PQ_BUILD_SCALAR
     pq_index.build(base, base_number, vecdim);
 #elif BUILD_PQ == PQ_BUILD_SIMD
-    pq_build_index_simd(pq_index, base, base_number, vecdim);
-#elif BUILD_PQ == PQ_BUILD_SIMD_BLOCKED
     pq_build_index_simd_blocked(pq_index, base, base_number, vecdim);
 #else
-    #error "Unknown BUILD_PQ value. Use PQ_BUILD_SCALAR, PQ_BUILD_SIMD, or PQ_BUILD_SIMD_BLOCKED."
+    #error "Unknown BUILD_PQ value. Use PQ_BUILD_SCALAR or PQ_BUILD_SIMD."
 #endif
     gettimeofday(&tb1, NULL);
     std::cerr << "[build] PQIndex (build_pq=" << BUILD_PQ << "): "

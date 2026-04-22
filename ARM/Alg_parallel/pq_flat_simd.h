@@ -322,7 +322,7 @@ static constexpr size_t PQ_KMEANS_BLOCK_N = 128; // vectors per i-tile for true 
 //     std::vector<size_t> perm(n);
 //     for (size_t i = 0; i < n; ++i) perm[i] = i;
 //     unsigned rng = 0xA5A5A5A5u;
-//     for (size_t i = n - 1; i > 0; --i) 
+//     for (size_t i = n - 1; i > 0; --i)
 //     {
 //         rng = rng * 1664525u + 1013904223u;
 //         size_t j = rng % (i + 1);
@@ -337,13 +337,13 @@ static constexpr size_t PQ_KMEANS_BLOCK_N = 128; // vectors per i-tile for true 
 //     std::vector<float>    norm2_c(K);
 //     std::vector<float>    ip_buf(K);
 
-//     for (int iter = 0; iter < n_iters; ++iter) 
+//     for (int iter = 0; iter < n_iters; ++iter)
 //     {
 //         // Transpose centroids [k][j] → [j][k] and precompute ||c_k||^2
-//         for (size_t k = 0; k < K; ++k) 
+//         for (size_t k = 0; k < K; ++k)
 //         {
 //             float n2 = 0.0f;
-//             for (size_t j = 0; j < dsub; ++j) 
+//             for (size_t j = 0; j < dsub; ++j)
 //             {
 //                 float v = centroids[k * dsub + j];
 //                 cents_t[j * K + k] = v;
@@ -353,7 +353,7 @@ static constexpr size_t PQ_KMEANS_BLOCK_N = 128; // vectors per i-tile for true 
 //         }
 
 //         // Assign step: cross-centroid blocked + unrolled SIMD
-//         for (size_t i = 0; i < n; ++i) 
+//         for (size_t i = 0; i < n; ++i)
 //         {
 //             const float* v = data + i * dsub;
 
@@ -361,15 +361,15 @@ static constexpr size_t PQ_KMEANS_BLOCK_N = 128; // vectors per i-tile for true 
 //             for (size_t j = 0; j < dsub; ++j) norm2_v += v[j] * v[j];
 
 //             // Compute IP(v, all K centroids) with BLOCK_K tiling + 4× unroll
-//             for (size_t k_blk = 0; k_blk < K; k_blk += PQ_KMEANS_BLOCK_K) 
+//             for (size_t k_blk = 0; k_blk < K; k_blk += PQ_KMEANS_BLOCK_K)
 //             {
-//                 for (size_t k = k_blk; k < k_blk + PQ_KMEANS_BLOCK_K; k += 16) 
+//                 for (size_t k = k_blk; k < k_blk + PQ_KMEANS_BLOCK_K; k += 16)
 //                 {
 //                     float32x4_t acc0 = vdupq_n_f32(0.0f);
 //                     float32x4_t acc1 = vdupq_n_f32(0.0f);
 //                     float32x4_t acc2 = vdupq_n_f32(0.0f);
 //                     float32x4_t acc3 = vdupq_n_f32(0.0f);
-//                     for (size_t j = 0; j < dsub; ++j) 
+//                     for (size_t j = 0; j < dsub; ++j)
 //                     {
 //                         const float        v_j = v[j];
 //                         const float* const ptr = cents_t.data() + j * K + k;
@@ -388,7 +388,7 @@ static constexpr size_t PQ_KMEANS_BLOCK_N = 128; // vectors per i-tile for true 
 //             // Find nearest centroid: argmin of d2 = norm2_v + norm2_c[k] - 2*ip[k]
 //             float    best_d2 = std::numeric_limits<float>::max();
 //             uint32_t best_k  = 0;
-//             for (size_t k = 0; k < K; ++k) 
+//             for (size_t k = 0; k < K; ++k)
 //             {
 //                 float d2 = norm2_v + norm2_c[k] - 2.0f * ip_buf[k];
 //                 if (d2 < best_d2) { best_d2 = d2; best_k = static_cast<uint32_t>(k); }
@@ -399,16 +399,16 @@ static constexpr size_t PQ_KMEANS_BLOCK_N = 128; // vectors per i-tile for true 
 //         // Update step: recompute centroids as cluster means (scalar)
 //         memset(centroids, 0, K * dsub * sizeof(float));
 //         std::fill(cnt.begin(), cnt.end(), 0.0f);
-//         for (size_t i = 0; i < n; ++i) 
+//         for (size_t i = 0; i < n; ++i)
 //         {
 //             const float* v = data + i * dsub;
 //             float*       c = centroids + assign[i] * dsub;
 //             for (size_t j = 0; j < dsub; ++j) c[j] += v[j];
 //             cnt[assign[i]] += 1.0f;
 //         }
-//         for (size_t k = 0; k < K; ++k) 
+//         for (size_t k = 0; k < K; ++k)
 //         {
-//             if (cnt[k] > 0.0f) 
+//             if (cnt[k] > 0.0f)
 //             {
 //                 float inv = 1.0f / cnt[k];
 //                 float* c  = centroids + k * dsub;
