@@ -188,15 +188,15 @@ int main(int argc, char *argv[])
         "pq_build_index_simd_blocked (SIMD double-tiled)",               //  3
     };
 
-    std::cout << "========================================\n";
-    std::cout << "[config] search_alg = " << SEARCH_ALG
+    std::cerr << "========================================\n";
+    std::cerr << "[config] search_alg = " << SEARCH_ALG
               << "  " << search_names[SEARCH_ALG] << "\n";
 #if SEARCH_ALG >= PQ_NORMAL
-    std::cout << "[config] build_pq   = " << BUILD_PQ
+    std::cerr << "[config] build_pq   = " << BUILD_PQ
               << "  " << build_names[BUILD_PQ] << "\n";
 #endif
-    std::cout << "[config] p=" << p << "  k=10\n";
-    std::cout << "========================================\n";
+    std::cerr << "[config] p=" << p << "  k=10\n";
+    std::cerr << "========================================\n";
 
     // ── Load dataset ─────────────────────────────────────────────────────────
     size_t test_number = 0, base_number = 0;
