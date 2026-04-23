@@ -30,7 +30,8 @@
 // =============================================================================
 
 // =============================================================================
-//  EXPERIMENT CONFIGURATION — change SEARCH_ALG and BUILD_PQ, then recompile.
+//  EXPERIMENT CONFIGURATION — change SEARCH_ALG, BUILD_PQ, and COARSE_P,
+//  then recompile.
 //
 //  SEARCH_ALG values:
 //   ── Exact flat scan ──────────────────────────────────────────────────────
@@ -52,6 +53,11 @@
 //  BUILD_PQ values (only used when SEARCH_ALG is 8–12; ignored otherwise):
 //    1  PQ_BUILD_SCALAR   pq_index.build()                scalar k-means
 //    2  PQ_BUILD_SIMD     pq_build_index_simd_blocked()   SIMD double-tiled (i_blk × k_blk)
+//
+//  COARSE_P — coarse candidate count for SQ/PQ rerank (SEARCH_ALG 5–12).
+//    Ignored for SEARCH_ALG 1–4 (exact flat scan needs no coarse filter).
+//    Larger COARSE_P → higher recall, higher latency.
+//    Typical range: 100 (fast) – 1000 (high recall).
 // =============================================================================
 #define FLAT_SCALAR            1
 #define FLAT_NORMAL            2
@@ -72,6 +78,7 @@
 // ── SET YOUR EXPERIMENT HERE ─────────────────────────────────────────────────
 #define SEARCH_ALG   SQ_SIMD
 #define BUILD_PQ     PQ_BUILD_SIMD
+#define COARSE_P     200
 // ─────────────────────────────────────────────────────────────────────────────
 
 // =============================================================================
@@ -98,9 +105,7 @@
 
 using namespace hnswlib;
 
-// Coarse candidate count for SQ/PQ rerank (SEARCH_ALG 5–12).
-// Larger p → higher recall, higher latency.
-static const size_t p = 200;
+static const size_t p = COARSE_P;
 
 // LoadData<T> — reads a binary vector file into a flat array
 //
