@@ -41,14 +41,14 @@ inline float sq8_coarse_dot_simd(const uint8_t* code, const float* adj_query, si
 
     for (size_t j = 0; j < dim; j += 16)
     {
-        // Load 16 uint8 codes in a single 128-bit register
+        //Load 16 uint8 codes in a single 128-bit register
         uint8x16_t c8 = vld1q_u8(code + j);
 
-        // Widen 16 × uint8  →  two 8 × uint16 vectors (low half, high half)
+        //Widen 16 × uint8  →  two 8 × uint16 vectors (low half, high half)
         uint16x8_t c16_lo = vmovl_u8(vget_low_u8(c8));    // codes 0..7
         uint16x8_t c16_hi = vmovl_u8(vget_high_u8(c8));   // codes 8..15
 
-        // Widen 8 × uint16 →  four 4 × uint32 → four 4 × float32
+        //Widen 8 × uint16 →  four 4 × uint32 → four 4 × float32
         float32x4_t f0 = vcvtq_f32_u32(vmovl_u16(vget_low_u16 (c16_lo)));  // 0..3
         float32x4_t f1 = vcvtq_f32_u32(vmovl_u16(vget_high_u16(c16_lo)));  // 4..7
         float32x4_t f2 = vcvtq_f32_u32(vmovl_u16(vget_low_u16 (c16_hi)));  // 8..11

@@ -21,7 +21,7 @@ CXXFLAGS="-O2 -std=c++11 -fopenmp -lpthread -I."
 SRC="exp/perf_exp.cc"
 
 # Algorithm id : name pairs
-ALG_IDS="3 4 6 7 9 11 12"
+ALG_IDS="3 4 6 7 9 11 12 13"
 alg_name() {
     case $1 in
         3)  echo "FLAT_SIMD"        ;;
@@ -31,6 +31,7 @@ alg_name() {
         9)  echo "PQ_RERANK"        ;;
         11) echo "PQ_CC_SIMD"       ;;
         12) echo "PQ_CC_UNROLL"     ;;
+        13) echo "PQ_GATHER"        ;;
         *)  echo "ALG_$1"           ;;
     esac
 }
@@ -63,6 +64,6 @@ done
 
 echo "$SEP"
 echo " Done. Binaries: exp/perf_exp_{3,4,6,7,9,11,12}"
-echo " To rerun one:   ./exp/perf_exp_6"
+echo " To rerun one:   ./exp/perf_exp_13"
 echo " To check perf permissions: cat /proc/sys/kernel/perf_event_paranoid"
 echo "$SEP"

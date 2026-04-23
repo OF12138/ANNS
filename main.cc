@@ -49,8 +49,9 @@
 //   10  PQ_FLAT_SIMD     pq_flat_search_rerank_flat_simd()          flat-SIMD LUT (1 acc/centroid)
 //   11  PQ_CC_SIMD       pq_flat_search_rerank_cross_centroid_simd() CC-SIMD LUT (0 reductions)
 //   12  PQ_CC_UNROLL     pq_flat_search_rerank_cc_unroll()           CC-SIMD LUT + 4× unroll
+//   13  PQ_GATHER        pq_flat_search_rerank_gather()              cc_unroll LUT + NEON gather scan
 //
-//  BUILD_PQ values (only used when SEARCH_ALG is 8–12; ignored otherwise):
+//  BUILD_PQ values (only used when SEARCH_ALG is 8–13; ignored otherwise):
 //    1  PQ_BUILD_SCALAR   pq_index.build()                scalar k-means
 //    2  PQ_BUILD_SIMD     pq_build_index_simd_blocked()   SIMD double-tiled (i_blk × k_blk)
 //
@@ -71,6 +72,7 @@
 #define PQ_FLAT_SIMD          10
 #define PQ_CC_SIMD            11
 #define PQ_CC_UNROLL          12
+#define PQ_GATHER             13
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -183,6 +185,7 @@ int main(int argc, char *argv[])
         "pq_flat_search_rerank_flat_simd (PQ flat-SIMD LUT)",            // 10
         "pq_flat_search_rerank_cross_centroid_simd (PQ CC-SIMD LUT)",    // 11
         "pq_flat_search_rerank_cc_unroll (PQ CC-SIMD 4x-unroll LUT)",   // 12
+        "pq_flat_search_rerank_gather (PQ gather scan + cc_unroll LUT)", // 13
     };
     static const char* build_names[] = {
         "",
@@ -241,8 +244,8 @@ int main(int argc, char *argv[])
     std::cerr << "[build] PQIndex (build_pq=" << BUILD_PQ << "): "
               << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 
-    // Transposed centroid layout — only needed by CC-SIMD variants (11, 12)
-#if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL
+    // Transposed centroid layout — needed by CC-SIMD variants (11, 12, 13)
+#if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL || SEARCH_ALG == PQ_GATHER
     PQIndexSIMD pq_simd(pq_index);
 #endif
 #endif
@@ -274,7 +277,7 @@ int main(int argc, char *argv[])
             pq_build_lut_flat_simd(pq_index, q, dtable_tmp.data());
 #elif SEARCH_ALG == PQ_CC_SIMD
             pq_build_lut_cross_centroid_simd(pq_simd, q, dtable_tmp.data());
-#elif SEARCH_ALG == PQ_CC_UNROLL
+#elif SEARCH_ALG == PQ_CC_UNROLL || SEARCH_ALG == PQ_GATHER
             pq_build_lut_cc_unroll(pq_simd, q, dtable_tmp.data());
 #endif
             gettimeofday(&lb, NULL);
@@ -316,8 +319,10 @@ int main(int argc, char *argv[])
         auto res = pq_flat_search_rerank_cross_centroid_simd(pq_simd, base, test_query + i*vecdim, k, p);
 #elif SEARCH_ALG == PQ_CC_UNROLL
         auto res = pq_flat_search_rerank_cc_unroll(pq_simd, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == PQ_GATHER
+        auto res = pq_flat_search_rerank_gather(pq_simd, base, test_query + i*vecdim, k, p);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–12)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–13)."
 #endif
 
         gettimeofday(&newVal, NULL);

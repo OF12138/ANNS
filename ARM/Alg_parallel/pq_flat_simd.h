@@ -469,6 +469,182 @@ static constexpr size_t PQ_KMEANS_BLOCK_N = 128; // vectors per i-tile for true 
 // }
 
 // =============================================================================
+// NEON gather coarse scan
+//
+// ARM has no hardware gather instruction for float32.  We emulate one with
+// vld1_dup_f32 + vld1_lane_f32 + vcombine_f32, which generates exactly 4
+// scalar loads and places them into one float32x4_t.  Calling neon_gather4
+// twice covers all M=8 subspaces; vaddvq_f32(vaddq_f32(lo,hi)) reduces the
+// 8 values to a single approx_ip in one tree of NEON adds.
+//
+// The outer loop is 4× unrolled so that the 32 gather loads for four
+// consecutive base vectors are in-flight simultaneously, hiding the ~4-cycle
+// load-use latency on Kunpeng-920's out-of-order engine.
+//
+// Precondition: index.M == 8  (DEEP100K: M=8, K=256 ✓)
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// neon_gather4 — load 4 floats from 4 independent addresses into float32x4
+//
+// vld1_dup_f32(p)        : [*p, *p]            (broadcast)
+// vld1_lane_f32(p,v,1)   : [v[0], *p]          (replace lane 1)
+// vcombine_f32(lo, hi)   : [lo[0], lo[1], hi[0], hi[1]]
+// Result                 : [*p0, *p1, *p2, *p3]
+// ---------------------------------------------------------------------------
+static inline float32x4_t neon_gather4(const float* p0, const float* p1,
+                                        const float* p2, const float* p3)
+{
+    float32x2_t lo = vld1_dup_f32(p0);
+    lo             = vld1_lane_f32(p1, lo, 1);
+    float32x2_t hi = vld1_dup_f32(p2);
+    hi             = vld1_lane_f32(p3, hi, 1);
+    return vcombine_f32(lo, hi);
+}
+
+// ---------------------------------------------------------------------------
+// pq_rerank_from_dtable_gather — coarse scan with NEON gather + rerank
+//
+// Drop-in replacement for pq_rerank_from_dtable.
+// Inner loop change: scalar `for m: approx_ip += dtable[m*K+code[m]]`
+// → two neon_gather4 calls + vaddvq_f32, eliminating the M=8 inner loop.
+// Outer loop unrolled 4× to expose 32 independent gather loads per iteration.
+// ---------------------------------------------------------------------------
+static inline std::priority_queue<std::pair<float, uint32_t>>
+pq_rerank_from_dtable_gather(const PQIndex& index, const float* base,
+                              const float* query,  size_t k, size_t p,
+                              const float* dtable)
+{
+    const size_t M = index.M;   // 8
+    const size_t K = index.K;
+    const size_t d = index.vecdim;
+    const size_t N = index.base_number;
+
+    // Per-subspace LUT base pointers — avoids m*K multiply inside hot loop
+    const float* lut[8] = 
+    {
+        dtable,       dtable +   K, dtable + 2*K, dtable + 3*K,
+        dtable + 4*K, dtable + 5*K, dtable + 6*K, dtable + 7*K
+    };
+
+    const uint8_t* codes = index.codes.data();
+
+    std::priority_queue<std::pair<float, uint32_t>> coarse_heap;
+
+    // Heap insertion helper (lambda keeps the hot loop free of duplicated code)
+    auto heap_push = [&](float ip, uint32_t id) 
+    {
+        float dis = 1.0f - ip;
+        if (coarse_heap.size() < p) 
+        {
+            coarse_heap.push({dis, id});
+        } 
+        else if (dis < coarse_heap.top().first) 
+        {
+            coarse_heap.push({dis, id});
+            coarse_heap.pop();
+        }
+    };
+
+    // ── 4× unrolled gather loop ──────────────────────────────────────────────
+    // Each iteration processes 4 base vectors, issuing 4×8=32 gather loads.
+    // Independent across vectors → OOO engine overlaps load latencies.
+    size_t i = 0;
+    for (; i + 4 <= N; i += 4) 
+    {
+        // Load 4 × 8 code bytes (4 consecutive vld1_u8)
+        uint8x8_t cv0 = vld1_u8(codes + (i+0)*M);
+        uint8x8_t cv1 = vld1_u8(codes + (i+1)*M);
+        uint8x8_t cv2 = vld1_u8(codes + (i+2)*M);
+        uint8x8_t cv3 = vld1_u8(codes + (i+3)*M);
+
+        // Gather M=8 floats per vector into lo (subspaces 0-3) + hi (4-7)
+        float32x4_t lo0 = neon_gather4(lut[0]+vget_lane_u8(cv0,0), lut[1]+vget_lane_u8(cv0,1),
+                                        lut[2]+vget_lane_u8(cv0,2), lut[3]+vget_lane_u8(cv0,3));
+        float32x4_t hi0 = neon_gather4(lut[4]+vget_lane_u8(cv0,4), lut[5]+vget_lane_u8(cv0,5),
+                                        lut[6]+vget_lane_u8(cv0,6), lut[7]+vget_lane_u8(cv0,7));
+
+        float32x4_t lo1 = neon_gather4(lut[0]+vget_lane_u8(cv1,0), lut[1]+vget_lane_u8(cv1,1),
+                                        lut[2]+vget_lane_u8(cv1,2), lut[3]+vget_lane_u8(cv1,3));
+        float32x4_t hi1 = neon_gather4(lut[4]+vget_lane_u8(cv1,4), lut[5]+vget_lane_u8(cv1,5),
+                                        lut[6]+vget_lane_u8(cv1,6), lut[7]+vget_lane_u8(cv1,7));
+
+        float32x4_t lo2 = neon_gather4(lut[0]+vget_lane_u8(cv2,0), lut[1]+vget_lane_u8(cv2,1),
+                                        lut[2]+vget_lane_u8(cv2,2), lut[3]+vget_lane_u8(cv2,3));
+        float32x4_t hi2 = neon_gather4(lut[4]+vget_lane_u8(cv2,4), lut[5]+vget_lane_u8(cv2,5),
+                                        lut[6]+vget_lane_u8(cv2,6), lut[7]+vget_lane_u8(cv2,7));
+
+        float32x4_t lo3 = neon_gather4(lut[0]+vget_lane_u8(cv3,0), lut[1]+vget_lane_u8(cv3,1),
+                                        lut[2]+vget_lane_u8(cv3,2), lut[3]+vget_lane_u8(cv3,3));
+        float32x4_t hi3 = neon_gather4(lut[4]+vget_lane_u8(cv3,4), lut[5]+vget_lane_u8(cv3,5),
+                                        lut[6]+vget_lane_u8(cv3,6), lut[7]+vget_lane_u8(cv3,7));
+
+        // Sum 8 gathered values → 1 approx_ip per vector
+        float ip0 = vaddvq_f32(vaddq_f32(lo0, hi0));
+        float ip1 = vaddvq_f32(vaddq_f32(lo1, hi1));
+        float ip2 = vaddvq_f32(vaddq_f32(lo2, hi2));
+        float ip3 = vaddvq_f32(vaddq_f32(lo3, hi3));
+
+        heap_push(ip0, (uint32_t)(i+0));
+        heap_push(ip1, (uint32_t)(i+1));
+        heap_push(ip2, (uint32_t)(i+2));
+        heap_push(ip3, (uint32_t)(i+3));
+    }
+
+    // ── Scalar tail for N % 4 remaining vectors ──────────────────────────────
+    for (; i < N; ++i) 
+    {
+        uint8x8_t cv = vld1_u8(codes + i*M);
+        float32x4_t lo = neon_gather4(lut[0]+vget_lane_u8(cv,0), lut[1]+vget_lane_u8(cv,1),
+                                       lut[2]+vget_lane_u8(cv,2), lut[3]+vget_lane_u8(cv,3));
+        float32x4_t hi = neon_gather4(lut[4]+vget_lane_u8(cv,4), lut[5]+vget_lane_u8(cv,5),
+                                       lut[6]+vget_lane_u8(cv,6), lut[7]+vget_lane_u8(cv,7));
+        heap_push(vaddvq_f32(vaddq_f32(lo, hi)), (uint32_t)i);
+    }
+
+    // ── Rerank (identical to pq_rerank_from_dtable) ──────────────────────────
+    std::vector<uint32_t> cand_ids;
+    cand_ids.reserve(p);
+    while (!coarse_heap.empty()) 
+    {
+        cand_ids.push_back(coarse_heap.top().second);
+        coarse_heap.pop();
+    }
+
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (uint32_t id : cand_ids) {
+        const float* bv = base + (size_t)id * d;
+        float ip = 0.0f;
+        for (size_t j = 0; j < d; ++j) ip += bv[j] * query[j];
+        float dis = 1.0f - ip;
+        if (result.size() < k) {
+            result.push({dis, id});
+        } else if (dis < result.top().first) {
+            result.push({dis, id});
+            result.pop();
+        }
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// pq_flat_search_rerank_gather — two-phase PQ search: cc_unroll LUT + gather scan
+//
+// Pairs the best LUT build (cc_unroll, 0 reductions) with the gather coarse
+// scan (eliminates the M=8 inner loop).  Uses PQIndexSIMD for the transposed
+// centroid layout required by cc_unroll.
+// ---------------------------------------------------------------------------
+inline std::priority_queue<std::pair<float, uint32_t>>
+pq_flat_search_rerank_gather(const PQIndexSIMD& pq_simd, const float* base,
+                              const float* query, size_t k, size_t p)
+{
+    const PQIndex& index = *pq_simd.idx;
+    std::vector<float> dtable(index.M * index.K);
+    pq_build_lut_cc_unroll(pq_simd, query, dtable.data());
+    return pq_rerank_from_dtable_gather(index, base, query, k, p, dtable.data());
+}
+
+// =============================================================================
 // True matrix-matrix cache-blocked k-means (double-tiled: i_blk × k_blk)
 //
 // The previous pq_kmeans_simd only tiles k (for k_blk inside for i), which means

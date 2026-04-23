@@ -31,6 +31,7 @@
 #define PQ_FLAT_SIMD     10
 #define PQ_CC_SIMD       11
 #define PQ_CC_UNROLL     12
+#define PQ_GATHER        13
 
 #define PQ_BUILD_SCALAR   1
 #define PQ_BUILD_SIMD     2
@@ -186,7 +187,7 @@ int main()
     gettimeofday(&tb1, NULL);
     std::cerr << "[build] PQIndex: " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 
-#if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL
+#if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL || SEARCH_ALG == PQ_GATHER
     PQIndexSIMD pq_simd(pq_index);
 #endif
 #endif
@@ -244,8 +245,10 @@ int main()
         auto res = pq_flat_search_rerank_cross_centroid_simd(pq_simd, base, q, k, p);
 #elif SEARCH_ALG == PQ_CC_UNROLL
         auto res = pq_flat_search_rerank_cc_unroll(pq_simd, base, q, k, p);
+#elif SEARCH_ALG == PQ_GATHER
+        auto res = pq_flat_search_rerank_gather(pq_simd, base, q, k, p);
 #else
-        #error "Unknown SEARCH_ALG value (1-12)."
+        #error "Unknown SEARCH_ALG value (1-13)."
 #endif
 
         std::set<uint32_t> gtset;
