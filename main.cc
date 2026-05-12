@@ -73,14 +73,22 @@
 #define PQ_CC_SIMD            11
 #define PQ_CC_UNROLL          12
 #define PQ_GATHER             13
+//   ── Pthread flat scan ────────────────────────────────────────────────────
+//   14  FLAT_SIMD_QUERY_PTHREAD  simd_flat_search_query_parallel()  all queries split across threads
+//   15  FLAT_SIMD_BASE_PTHREAD   simd_flat_search_base_parallel()   one query, base split across threads
+#define FLAT_SIMD_QUERY_PTHREAD   14
+#define FLAT_SIMD_BASE_PTHREAD    15
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
 
 // ── SET YOUR EXPERIMENT HERE ─────────────────────────────────────────────────
-#define SEARCH_ALG   SQ_SIMD
+#define SEARCH_ALG   FLAT_SIMD_UNROLL
 #define BUILD_PQ     PQ_BUILD_SIMD
 #define COARSE_P     200
+// Number of Pthread worker threads (used by SEARCH_ALG 14 and 15).
+// Server has 8 cores; 7 workers + 1 main thread = full utilisation.
+#define FLAT_PTHREAD_THREADS   7
 // ─────────────────────────────────────────────────────────────────────────────
 
 // =============================================================================
@@ -102,6 +110,7 @@
 #include "ARM/Alg_normal/sq_flat_normal.h"
 #include "ARM/Alg_normal/pq_flat_normal.h"
 #include "ARM/Alg_parallel/flat_simd.h"
+#include "ARM/Alg_parallel/flat_simd_pthread.h"
 #include "ARM/Alg_parallel/sq_flat_simd.h"
 #include "ARM/Alg_parallel/pq_flat_simd.h"
 
@@ -186,6 +195,8 @@ int main(int argc, char *argv[])
         "pq_flat_search_rerank_cross_centroid_simd (PQ CC-SIMD LUT)",    // 11
         "pq_flat_search_rerank_cc_unroll (PQ CC-SIMD 4x-unroll LUT)",   // 12
         "pq_flat_search_rerank_gather (PQ gather scan + cc_unroll LUT)", // 13
+        "simd_flat_search_query_parallel (pthread, query-level)",        // 14
+        "simd_flat_search_base_parallel  (pthread, base-partition)",     // 15
     };
     static const char* build_names[] = {
         "",
@@ -196,9 +207,12 @@ int main(int argc, char *argv[])
     std::cerr << "========================================\n";
     std::cerr << "[config] search_alg = " << SEARCH_ALG
               << "  " << search_names[SEARCH_ALG] << "\n";
-#if SEARCH_ALG >= PQ_NORMAL
+#if SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER
     std::cerr << "[config] build_pq   = " << BUILD_PQ
               << "  " << build_names[BUILD_PQ] << "\n";
+#endif
+#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_BASE_PTHREAD
+    std::cerr << "[config] pthread_threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
     std::cerr << "========================================\n";
@@ -230,7 +244,7 @@ int main(int argc, char *argv[])
     std::cerr << "[build] SQIndex: " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 #endif
 
-#if SEARCH_ALG >= PQ_NORMAL
+#if SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER
     PQIndex pq_index;
     gettimeofday(&tb0, NULL);
 #if   BUILD_PQ == PQ_BUILD_SCALAR
@@ -253,7 +267,7 @@ int main(int argc, char *argv[])
     // ── LUT build phase timing ────────────────────────────────────────────────
     // Runs a LUT-build-only loop BEFORE the main timed loop.
     // The reported average latency below is NOT affected by this.
-#if SEARCH_ALG >= PQ_RERANK
+#if SEARCH_ALG >= PQ_RERANK && SEARCH_ALG <= PQ_GATHER
     double avg_lut_us = 0.0;
     {
         std::vector<float> dtable_tmp(pq_index.M * pq_index.K);
@@ -289,6 +303,38 @@ int main(int argc, char *argv[])
     std::cerr << "[phase] avg LUT build:   " << avg_lut_us << " us\n";
 #endif
 
+    // ── Pthread query-parallel: run all queries in one batch before the loop ──
+    // Wall time is measured around the batch call; per-query latency is computed
+    // as total_time / num_queries (throughput metric, not per-query latency).
+#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD
+    using _PQType = std::priority_queue<std::pair<float, uint32_t>>;
+    std::vector<_PQType> pth_batch(test_number);
+    {
+        struct timeval tq0, tq1;
+        gettimeofday(&tq0, NULL);
+        simd_flat_search_query_parallel(
+            base, test_query, base_number, vecdim, k,
+            (int)test_number, pth_batch.data(), FLAT_PTHREAD_THREADS);
+        gettimeofday(&tq1, NULL);
+        int64_t total_us = tv_diff_us(tq0, tq1);
+        std::cerr << "[pthread] query-parallel:"
+                  << "  threads=" << FLAT_PTHREAD_THREADS
+                  << "  total="   << total_us << " us"
+                  << "  avg/query=" << total_us / (int64_t)test_number << " us\n";
+    }
+    // pth_batch_avg will be used as the reported latency inside the loop below
+    int64_t pth_batch_avg_us = 0;
+    {
+        struct timeval tq0, tq1;
+        gettimeofday(&tq0, NULL);
+        simd_flat_search_query_parallel(
+            base, test_query, base_number, vecdim, k,
+            (int)test_number, pth_batch.data(), FLAT_PTHREAD_THREADS);
+        gettimeofday(&tq1, NULL);
+        pth_batch_avg_us = tv_diff_us(tq0, tq1) / (int64_t)test_number;
+    }
+#endif
+
     // ── Query loop ────────────────────────────────────────────────────────────
     for(int i = 0; i < (int)test_number; ++i)
     {
@@ -321,12 +367,23 @@ int main(int argc, char *argv[])
         auto res = pq_flat_search_rerank_cc_unroll(pq_simd, base, test_query + i*vecdim, k, p);
 #elif SEARCH_ALG == PQ_GATHER
         auto res = pq_flat_search_rerank_gather(pq_simd, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD
+        // Results were computed in the pre-loop batch; just move them out.
+        auto res = std::move(pth_batch[i]);
+#elif SEARCH_ALG == FLAT_SIMD_BASE_PTHREAD
+        auto res = simd_flat_search_base_parallel(
+            base, test_query + i*vecdim, base_number, vecdim, k, FLAT_PTHREAD_THREADS);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–13)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–15)."
 #endif
 
         gettimeofday(&newVal, NULL);
         int64_t diff = tv_diff_us(val, newVal);
+        // Query-parallel: override diff with the batch-level throughput latency.
+        // The per-iteration gettimeofday only measures the std::move, not the search.
+#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD
+        diff = pth_batch_avg_us;
+#endif
 
         std::set<uint32_t> gtset;
         for(int j = 0; j < (int)k; ++j)
@@ -351,7 +408,7 @@ int main(int argc, char *argv[])
     // 浮点误差可能导致一些精确算法平均recall不是1
     std::cout << "average recall: "       << avg_recall  / test_number << "\n";
     std::cout << "average latency (us): " << avg_latency / test_number << "\n";
-#if SEARCH_ALG >= PQ_RERANK
+#if SEARCH_ALG >= PQ_RERANK && SEARCH_ALG <= PQ_GATHER
     {
         double avg_total      = (double)avg_latency / test_number;
         double scan_rerank_us = avg_total - avg_lut_us;
