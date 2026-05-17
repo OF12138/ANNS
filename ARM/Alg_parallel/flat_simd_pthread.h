@@ -53,7 +53,8 @@
 // =============================================================================
 
 // Thread argument: each thread owns queries [q_start, q_end) exclusively.
-struct _FlatQueryPArgs {
+struct _FlatQueryPArgs 
+{
     float*  base;
     float*  queries;
     size_t  base_number;
@@ -108,7 +109,8 @@ void simd_flat_search_query_parallel(
 
     // Ceiling division: last thread may get fewer than chunk queries
     int chunk = (num_queries + num_threads - 1) / num_threads;
-    for (int t = 0; t < num_threads; ++t) {
+    for (int t = 0; t < num_threads; ++t) 
+    {
         args[t].base        = base;
         args[t].queries     = queries;
         args[t].base_number = base_number;
@@ -146,12 +148,16 @@ struct _FlatBasePArgs {
 static void* _flat_base_worker(void* arg)
 {
     auto* a = static_cast<_FlatBasePArgs*>(arg);
-    for (size_t i = a->base_start; i < a->base_end; ++i) {
+    for (size_t i = a->base_start; i < a->base_end; ++i) 
+    {
         float dis = 1.0f - simd_inner_product_neon_unroll(
             a->base + i * a->vecdim, a->query, a->vecdim);
-        if (a->local_heap.size() < a->k) {
+        if (a->local_heap.size() < a->k) 
+        {
             a->local_heap.push({dis, static_cast<uint32_t>(i)});
-        } else if (dis < a->local_heap.top().first) {
+        } 
+        else if (dis < a->local_heap.top().first) 
+        {
             a->local_heap.push({dis, static_cast<uint32_t>(i)});
             a->local_heap.pop();
         }

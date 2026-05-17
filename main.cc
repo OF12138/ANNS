@@ -76,8 +76,13 @@
 //   ── Pthread flat scan ────────────────────────────────────────────────────
 //   14  FLAT_SIMD_QUERY_PTHREAD  simd_flat_search_query_parallel()  all queries split across threads
 //   15  FLAT_SIMD_BASE_PTHREAD   simd_flat_search_base_parallel()   one query, base split across threads
+//   ── OpenMP flat scan ─────────────────────────────────────────────────────
+//   16  FLAT_SIMD_QUERY_OMP      simd_flat_search_query_parallel_omp()  OpenMP query-level
+//   17  FLAT_SIMD_BASE_OMP       simd_flat_search_base_parallel_omp()   OpenMP base-partition
 #define FLAT_SIMD_QUERY_PTHREAD   14
 #define FLAT_SIMD_BASE_PTHREAD    15
+#define FLAT_SIMD_QUERY_OMP       16
+#define FLAT_SIMD_BASE_OMP        17
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -111,6 +116,7 @@
 #include "ARM/Alg_normal/pq_flat_normal.h"
 #include "ARM/Alg_parallel/flat_simd.h"
 #include "ARM/Alg_parallel/flat_simd_pthread.h"
+#include "ARM/Alg_parallel/flat_simd_omp.h"
 #include "ARM/Alg_parallel/sq_flat_simd.h"
 #include "ARM/Alg_parallel/pq_flat_simd.h"
 
@@ -197,6 +203,8 @@ int main(int argc, char *argv[])
         "pq_flat_search_rerank_gather (PQ gather scan + cc_unroll LUT)", // 13
         "simd_flat_search_query_parallel (pthread, query-level)",        // 14
         "simd_flat_search_base_parallel  (pthread, base-partition)",     // 15
+        "simd_flat_search_query_parallel_omp (openmp, query-level)",     // 16
+        "simd_flat_search_base_parallel_omp  (openmp, base-partition)",  // 17
     };
     static const char* build_names[] = {
         "",
@@ -211,8 +219,9 @@ int main(int argc, char *argv[])
     std::cerr << "[config] build_pq   = " << BUILD_PQ
               << "  " << build_names[BUILD_PQ] << "\n";
 #endif
-#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_BASE_PTHREAD
-    std::cerr << "[config] pthread_threads = " << FLAT_PTHREAD_THREADS << "\n";
+#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_BASE_PTHREAD \
+ || SEARCH_ALG == FLAT_SIMD_QUERY_OMP     || SEARCH_ALG == FLAT_SIMD_BASE_OMP
+    std::cerr << "[config] threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
     std::cerr << "========================================\n";
@@ -306,18 +315,24 @@ int main(int argc, char *argv[])
     // ── Pthread query-parallel: run all queries in one batch before the loop ──
     // Wall time is measured around the batch call; per-query latency is computed
     // as total_time / num_queries (throughput metric, not per-query latency).
-#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD
+#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_QUERY_OMP
     using _PQType = std::priority_queue<std::pair<float, uint32_t>>;
     std::vector<_PQType> pth_batch(test_number);
     {
         struct timeval tq0, tq1;
         gettimeofday(&tq0, NULL);
+#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD
         simd_flat_search_query_parallel(
             base, test_query, base_number, vecdim, k,
             (int)test_number, pth_batch.data(), FLAT_PTHREAD_THREADS);
+#else
+        simd_flat_search_query_parallel_omp(
+            base, test_query, base_number, vecdim, k,
+            (int)test_number, pth_batch.data(), FLAT_PTHREAD_THREADS);
+#endif
         gettimeofday(&tq1, NULL);
         int64_t total_us = tv_diff_us(tq0, tq1);
-        std::cerr << "[pthread] query-parallel:"
+        std::cerr << "[query-parallel warm-up]"
                   << "  threads=" << FLAT_PTHREAD_THREADS
                   << "  total="   << total_us << " us"
                   << "  avg/query=" << total_us / (int64_t)test_number << " us\n";
@@ -327,9 +342,15 @@ int main(int argc, char *argv[])
     {
         struct timeval tq0, tq1;
         gettimeofday(&tq0, NULL);
+#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD
         simd_flat_search_query_parallel(
             base, test_query, base_number, vecdim, k,
             (int)test_number, pth_batch.data(), FLAT_PTHREAD_THREADS);
+#else
+        simd_flat_search_query_parallel_omp(
+            base, test_query, base_number, vecdim, k,
+            (int)test_number, pth_batch.data(), FLAT_PTHREAD_THREADS);
+#endif
         gettimeofday(&tq1, NULL);
         pth_batch_avg_us = tv_diff_us(tq0, tq1) / (int64_t)test_number;
     }
@@ -373,15 +394,21 @@ int main(int argc, char *argv[])
 #elif SEARCH_ALG == FLAT_SIMD_BASE_PTHREAD
         auto res = simd_flat_search_base_parallel(
             base, test_query + i*vecdim, base_number, vecdim, k, FLAT_PTHREAD_THREADS);
+#elif SEARCH_ALG == FLAT_SIMD_QUERY_OMP
+        // Results were computed in the pre-loop batch; just move them out.
+        auto res = std::move(pth_batch[i]);
+#elif SEARCH_ALG == FLAT_SIMD_BASE_OMP
+        auto res = simd_flat_search_base_parallel_omp(
+            base, test_query + i*vecdim, base_number, vecdim, k, FLAT_PTHREAD_THREADS);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–15)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–17)."
 #endif
 
         gettimeofday(&newVal, NULL);
         int64_t diff = tv_diff_us(val, newVal);
         // Query-parallel: override diff with the batch-level throughput latency.
         // The per-iteration gettimeofday only measures the std::move, not the search.
-#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD
+#if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_QUERY_OMP
         diff = pth_batch_avg_us;
 #endif
 
