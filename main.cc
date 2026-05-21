@@ -88,6 +88,11 @@
 //   19  PQ_GATHER_QUERY_OMP      pq_batch_build_lut_omp()    + gather scan
 #define PQ_GATHER_QUERY_PTHREAD   18
 #define PQ_GATHER_QUERY_OMP       19
+//   ── PQ query-parallel scan+rerank ────────────────────────────────────────
+//   20  PQ_SCAN_QUERY_PTHREAD  pq_batch_scan_rerank_pthread()  gather scan parallel, pthread
+//   21  PQ_SCAN_QUERY_OMP      pq_batch_scan_rerank_omp()      gather scan parallel, OMP
+#define PQ_SCAN_QUERY_PTHREAD     20
+#define PQ_SCAN_QUERY_OMP         21
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -125,6 +130,7 @@
 #include "ARM/Alg_parallel/sq_flat_simd.h"
 #include "ARM/Alg_parallel/pq_flat_simd.h"
 #include "ARM/Alg_parallel/pq_flat_simd_lut_parallel.h"
+#include "ARM/Alg_parallel/pq_flat_simd_scan_parallel.h"
 
 using namespace hnswlib;
 
@@ -213,6 +219,8 @@ int main(int argc, char *argv[])
         "simd_flat_search_base_parallel_omp  (openmp, base-partition)",  // 17
         "pq_batch_build_lut_pthread + gather scan (pthread, query-parallel LUT)", // 18
         "pq_batch_build_lut_omp    + gather scan (omp,    query-parallel LUT)",   // 19
+        "pq_batch_scan_rerank_pthread (pthread, query-parallel scan+rerank)",     // 20
+        "pq_batch_scan_rerank_omp     (omp,    query-parallel scan+rerank)",      // 21
     };
     static const char* build_names[] = {
         "",
@@ -224,13 +232,15 @@ int main(int argc, char *argv[])
     std::cerr << "[config] search_alg = " << SEARCH_ALG
               << "  " << search_names[SEARCH_ALG] << "\n";
 #if (SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER) \
- || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
+ || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP \
+ || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
     std::cerr << "[config] build_pq   = " << BUILD_PQ
               << "  " << build_names[BUILD_PQ] << "\n";
 #endif
 #if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_BASE_PTHREAD \
  || SEARCH_ALG == FLAT_SIMD_QUERY_OMP     || SEARCH_ALG == FLAT_SIMD_BASE_OMP    \
- || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
+ || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP   \
+ || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
     std::cerr << "[config] threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
@@ -264,7 +274,8 @@ int main(int argc, char *argv[])
 #endif
 
 #if (SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER) \
- || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
+ || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP \
+ || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
     PQIndex pq_index;
     gettimeofday(&tb0, NULL);
 #if   BUILD_PQ == PQ_BUILD_SCALAR
@@ -280,7 +291,8 @@ int main(int argc, char *argv[])
 
     // Transposed centroid layout — needed by CC-SIMD variants (11, 12, 13)
 #if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL || SEARCH_ALG == PQ_GATHER \
- || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
+ || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP  \
+ || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
     PQIndexSIMD pq_simd(pq_index);
 #endif
 #endif
@@ -361,6 +373,58 @@ int main(int argc, char *argv[])
                   << "  threads="    << FLAT_PTHREAD_THREADS
                   << "  total="      << total_lut_us << " us"
                   << "  avg/query="  << (double)total_lut_us / test_number << " us\n";
+    }
+#endif
+
+    // ── PQ query-parallel scan+rerank: build LUTs once (serial), then parallel scan ──
+    // LUT is built single-threaded so we isolate the scan phase speedup.
+    // Compare [parallel scan] avg/query against [phase] avg scan+rerank (SEARCH_ALG 13).
+#if SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD || SEARCH_ALG == PQ_SCAN_QUERY_OMP
+    using _PQResType = std::priority_queue<std::pair<float, uint32_t>>;
+    const size_t scan_lut_size = pq_simd.idx->M * pq_simd.idx->K;
+
+    // Build all LUTs sequentially (single-thread, same as baseline SEARCH_ALG 13)
+    std::vector<float> scan_dtables((size_t)test_number * scan_lut_size);
+    for (int i = 0; i < (int)test_number; ++i)
+        pq_build_lut_cc_unroll(pq_simd, test_query + (size_t)i * vecdim,
+                               scan_dtables.data() + (size_t)i * scan_lut_size);
+
+    std::vector<_PQResType> pq_scan_results(test_number);
+
+    // warm-up run
+    {
+#if SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD
+        pq_batch_scan_rerank_pthread(*pq_simd.idx, base, test_query, (int)test_number,
+                                     vecdim, k, p, scan_dtables.data(),
+                                     pq_scan_results.data(), FLAT_PTHREAD_THREADS);
+#else
+        pq_batch_scan_rerank_omp(*pq_simd.idx, base, test_query, (int)test_number,
+                                  vecdim, k, p, scan_dtables.data(),
+                                  pq_scan_results.data(), FLAT_PTHREAD_THREADS);
+#endif
+    }
+    // measured run
+    int64_t pq_scan_batch_avg_us = 0;
+    {
+        struct timeval ts0, ts1;
+        gettimeofday(&ts0, NULL);
+#if SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD
+        pq_batch_scan_rerank_pthread(*pq_simd.idx, base, test_query, (int)test_number,
+                                     vecdim, k, p, scan_dtables.data(),
+                                     pq_scan_results.data(), FLAT_PTHREAD_THREADS);
+#else
+        pq_batch_scan_rerank_omp(*pq_simd.idx, base, test_query, (int)test_number,
+                                  vecdim, k, p, scan_dtables.data(),
+                                  pq_scan_results.data(), FLAT_PTHREAD_THREADS);
+#endif
+        gettimeofday(&ts1, NULL);
+        int64_t total_scan_us = tv_diff_us(ts0, ts1);
+        pq_scan_batch_avg_us  = total_scan_us / (int64_t)test_number;
+        std::cerr << std::fixed << std::setprecision(2);
+        std::cerr << "[parallel scan]"
+                  << "  threads="   << FLAT_PTHREAD_THREADS
+                  << "  total="     << total_scan_us << " us"
+                  << "  avg/query=" << (double)total_scan_us / test_number << " us\n";
     }
 #endif
 
@@ -457,8 +521,11 @@ int main(int argc, char *argv[])
         auto res = pq_rerank_from_dtable_gather(
             *pq_simd.idx, base, test_query + i*vecdim, k, p,
             all_dtables.data() + (size_t)i * lut_size);
+#elif SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD || SEARCH_ALG == PQ_SCAN_QUERY_OMP
+        // Results computed in parallel batch above; move out for recall eval.
+        auto res = std::move(pq_scan_results[i]);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–19)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–21)."
 #endif
 
         gettimeofday(&newVal, NULL);
@@ -467,6 +534,9 @@ int main(int argc, char *argv[])
         // The per-iteration gettimeofday only measures the std::move, not the search.
 #if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_QUERY_OMP
         diff = pth_batch_avg_us;
+#endif
+#if SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD || SEARCH_ALG == PQ_SCAN_QUERY_OMP
+        diff = pq_scan_batch_avg_us;
 #endif
 
         std::set<uint32_t> gtset;
