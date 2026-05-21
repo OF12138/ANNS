@@ -83,6 +83,11 @@
 #define FLAT_SIMD_BASE_PTHREAD    15
 #define FLAT_SIMD_QUERY_OMP       16
 #define FLAT_SIMD_BASE_OMP        17
+//   ── PQ query-parallel LUT construction ───────────────────────────────────
+//   18  PQ_GATHER_QUERY_PTHREAD  pq_batch_build_lut_pthread() + gather scan
+//   19  PQ_GATHER_QUERY_OMP      pq_batch_build_lut_omp()    + gather scan
+#define PQ_GATHER_QUERY_PTHREAD   18
+#define PQ_GATHER_QUERY_OMP       19
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -119,6 +124,7 @@
 #include "ARM/Alg_parallel/flat_simd_omp.h"
 #include "ARM/Alg_parallel/sq_flat_simd.h"
 #include "ARM/Alg_parallel/pq_flat_simd.h"
+#include "ARM/Alg_parallel/pq_flat_simd_lut_parallel.h"
 
 using namespace hnswlib;
 
@@ -205,6 +211,8 @@ int main(int argc, char *argv[])
         "simd_flat_search_base_parallel  (pthread, base-partition)",     // 15
         "simd_flat_search_query_parallel_omp (openmp, query-level)",     // 16
         "simd_flat_search_base_parallel_omp  (openmp, base-partition)",  // 17
+        "pq_batch_build_lut_pthread + gather scan (pthread, query-parallel LUT)", // 18
+        "pq_batch_build_lut_omp    + gather scan (omp,    query-parallel LUT)",   // 19
     };
     static const char* build_names[] = {
         "",
@@ -215,12 +223,14 @@ int main(int argc, char *argv[])
     std::cerr << "========================================\n";
     std::cerr << "[config] search_alg = " << SEARCH_ALG
               << "  " << search_names[SEARCH_ALG] << "\n";
-#if SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER
+#if (SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER) \
+ || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
     std::cerr << "[config] build_pq   = " << BUILD_PQ
               << "  " << build_names[BUILD_PQ] << "\n";
 #endif
 #if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_BASE_PTHREAD \
- || SEARCH_ALG == FLAT_SIMD_QUERY_OMP     || SEARCH_ALG == FLAT_SIMD_BASE_OMP
+ || SEARCH_ALG == FLAT_SIMD_QUERY_OMP     || SEARCH_ALG == FLAT_SIMD_BASE_OMP    \
+ || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
     std::cerr << "[config] threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
@@ -253,7 +263,8 @@ int main(int argc, char *argv[])
     std::cerr << "[build] SQIndex: " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 #endif
 
-#if SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER
+#if (SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER) \
+ || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
     PQIndex pq_index;
     gettimeofday(&tb0, NULL);
 #if   BUILD_PQ == PQ_BUILD_SCALAR
@@ -268,7 +279,8 @@ int main(int argc, char *argv[])
               << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 
     // Transposed centroid layout — needed by CC-SIMD variants (11, 12, 13)
-#if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL || SEARCH_ALG == PQ_GATHER
+#if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL || SEARCH_ALG == PQ_GATHER \
+ || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
     PQIndexSIMD pq_simd(pq_index);
 #endif
 #endif
@@ -310,6 +322,46 @@ int main(int argc, char *argv[])
     }
     std::cerr << std::fixed << std::setprecision(2);
     std::cerr << "[phase] avg LUT build:   " << avg_lut_us << " us\n";
+#endif
+
+    // ── PQ query-parallel LUT: build all LUTs in parallel, time the LUT phase ──
+    // all_dtables[i * M*K .. (i+1)*M*K) holds the pre-built LUT for query i.
+    // The query loop (below) uses these LUTs directly for scan+rerank — the
+    // per-iteration gettimeofday therefore measures scan+rerank only, not LUT.
+    // Compare [parallel LUT] avg/query against [phase] avg LUT build (SEARCH_ALG 13)
+    // to see the LUT speedup from parallelism.
+#if SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
+    const size_t lut_size = pq_simd.idx->M * pq_simd.idx->K;
+    std::vector<float> all_dtables((size_t)test_number * lut_size);
+    // warm-up run (fills caches, avoids cold-start bias)
+    {
+#if SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD
+        pq_batch_build_lut_pthread(pq_simd, test_query, (int)test_number, vecdim,
+                                   all_dtables.data(), FLAT_PTHREAD_THREADS);
+#else
+        pq_batch_build_lut_omp(pq_simd, test_query, (int)test_number, vecdim,
+                               all_dtables.data(), FLAT_PTHREAD_THREADS);
+#endif
+    }
+    // measured run
+    {
+        struct timeval tl0, tl1;
+        gettimeofday(&tl0, NULL);
+#if SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD
+        pq_batch_build_lut_pthread(pq_simd, test_query, (int)test_number, vecdim,
+                                   all_dtables.data(), FLAT_PTHREAD_THREADS);
+#else
+        pq_batch_build_lut_omp(pq_simd, test_query, (int)test_number, vecdim,
+                               all_dtables.data(), FLAT_PTHREAD_THREADS);
+#endif
+        gettimeofday(&tl1, NULL);
+        int64_t total_lut_us = tv_diff_us(tl0, tl1);
+        std::cerr << std::fixed << std::setprecision(2);
+        std::cerr << "[parallel LUT]"
+                  << "  threads="    << FLAT_PTHREAD_THREADS
+                  << "  total="      << total_lut_us << " us"
+                  << "  avg/query="  << (double)total_lut_us / test_number << " us\n";
+    }
 #endif
 
     // ── Pthread query-parallel: run all queries in one batch before the loop ──
@@ -400,8 +452,13 @@ int main(int argc, char *argv[])
 #elif SEARCH_ALG == FLAT_SIMD_BASE_OMP
         auto res = simd_flat_search_base_parallel_omp(
             base, test_query + i*vecdim, base_number, vecdim, k, FLAT_PTHREAD_THREADS);
+#elif SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP
+        // LUT was pre-built in parallel above; scan+rerank only here.
+        auto res = pq_rerank_from_dtable_gather(
+            *pq_simd.idx, base, test_query + i*vecdim, k, p,
+            all_dtables.data() + (size_t)i * lut_size);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–17)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–19)."
 #endif
 
         gettimeofday(&newVal, NULL);
