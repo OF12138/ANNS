@@ -93,6 +93,9 @@
 //   21  PQ_SCAN_QUERY_OMP      pq_batch_scan_rerank_omp()      gather scan parallel, OMP
 #define PQ_SCAN_QUERY_PTHREAD     20
 #define PQ_SCAN_QUERY_OMP         21
+//   ── IVF-SIMD baseline ────────────────────────────────────────────────────
+//   22  IVF_SIMD   ivf_search_simd()   two-phase: coarse centroid scan + fine NEON scan
+#define IVF_SIMD                  22
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -102,6 +105,13 @@
 #define BUILD_PQ     PQ_BUILD_SIMD
 #define COARSE_P     200
 // Number of Pthread worker threads (used by SEARCH_ALG 14 and 15).
+// IVF parameters (used by SEARCH_ALG 22):
+//   IVF_NLIST   : number of clusters (64–4096; sqrt(100K) ≈ 316, use 256 or 512)
+//   IVF_NPROBE  : clusters scanned per query (latency-recall knob; sweep 1–nlist)
+//   IVF_REORDER : 0 = original layout (random access), 1 = cluster-contiguous layout
+#define IVF_NLIST    256
+#define IVF_NPROBE   8
+#define IVF_REORDER  0
 // Server has 8 cores; 7 workers + 1 main thread = full utilisation.
 #define FLAT_PTHREAD_THREADS   7
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,6 +141,7 @@
 #include "ARM/Alg_parallel/pq_flat_simd.h"
 #include "ARM/Alg_parallel/pq_flat_simd_lut_parallel.h"
 #include "ARM/Alg_parallel/pq_flat_simd_scan_parallel.h"
+#include "ARM/Alg_parallel/ivf_flat_simd.h"
 
 using namespace hnswlib;
 
@@ -221,6 +232,7 @@ int main(int argc, char *argv[])
         "pq_batch_build_lut_omp    + gather scan (omp,    query-parallel LUT)",   // 19
         "pq_batch_scan_rerank_pthread (pthread, query-parallel scan+rerank)",     // 20
         "pq_batch_scan_rerank_omp     (omp,    query-parallel scan+rerank)",      // 21
+        "ivf_search_simd (IVF coarse+fine, NEON IP)",                             // 22
     };
     static const char* build_names[] = {
         "",
@@ -244,6 +256,11 @@ int main(int argc, char *argv[])
     std::cerr << "[config] threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
+#if SEARCH_ALG == IVF_SIMD
+    std::cerr << "[config] ivf_nlist="   << IVF_NLIST
+              << "  ivf_nprobe=" << IVF_NPROBE
+              << "  ivf_reorder=" << IVF_REORDER << "\n";
+#endif
     std::cerr << "========================================\n";
 
     // ── Load dataset ─────────────────────────────────────────────────────────
@@ -295,6 +312,18 @@ int main(int argc, char *argv[])
  || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
     PQIndexSIMD pq_simd(pq_index);
 #endif
+#endif
+
+#if SEARCH_ALG == IVF_SIMD
+    IVFIndex ivf_index;
+    gettimeofday(&tb0, NULL);
+    ivf_build(ivf_index, base, base_number, vecdim,
+              IVF_NLIST, 25, IVF_REORDER != 0);
+    gettimeofday(&tb1, NULL);
+    std::cerr << "[build] IVFIndex"
+              << " nlist="    << IVF_NLIST
+              << " reorder="  << IVF_REORDER
+              << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 #endif
 
     // ── LUT build phase timing ────────────────────────────────────────────────
@@ -524,8 +553,11 @@ int main(int argc, char *argv[])
 #elif SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD || SEARCH_ALG == PQ_SCAN_QUERY_OMP
         // Results computed in parallel batch above; move out for recall eval.
         auto res = std::move(pq_scan_results[i]);
+#elif SEARCH_ALG == IVF_SIMD
+        auto res = ivf_search_simd(ivf_index, base,
+                                   test_query + i*vecdim, k, IVF_NPROBE);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–21)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–22)."
 #endif
 
         gettimeofday(&newVal, NULL);
