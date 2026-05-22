@@ -109,8 +109,8 @@
 //   IVF_NLIST   : number of clusters (64–4096; sqrt(100K) ≈ 316, use 256 or 512)
 //   IVF_NPROBE  : clusters scanned per query (latency-recall knob; sweep 1–nlist)
 //   IVF_REORDER : 0 = original layout (random access), 1 = cluster-contiguous layout
-#define IVF_NLIST    256
-#define IVF_NPROBE   8
+#define IVF_NLIST    1024
+#define IVF_NPROBE   16
 #define IVF_REORDER  0
 // Server has 8 cores; 7 workers + 1 main thread = full utilisation.
 #define FLAT_PTHREAD_THREADS   7
@@ -316,14 +316,29 @@ int main(int argc, char *argv[])
 
 #if SEARCH_ALG == IVF_SIMD
     IVFIndex ivf_index;
-    gettimeofday(&tb0, NULL);
-    ivf_build(ivf_index, base, base_number, vecdim,
-              IVF_NLIST, 25, IVF_REORDER != 0);
-    gettimeofday(&tb1, NULL);
-    std::cerr << "[build] IVFIndex"
-              << " nlist="    << IVF_NLIST
-              << " reorder="  << IVF_REORDER
-              << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+    {
+        char ivf_cache[256];
+        snprintf(ivf_cache, sizeof(ivf_cache),
+                 "files/ivf_nlist%d_reorder%d.bin", IVF_NLIST, IVF_REORDER);
+        gettimeofday(&tb0, NULL);
+        if (ivf_load(ivf_index, ivf_cache)) {
+            gettimeofday(&tb1, NULL);
+            std::cerr << "[build] IVFIndex loaded from cache " << ivf_cache
+                      << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+        } else {
+            ivf_build(ivf_index, base, base_number, vecdim,
+                      IVF_NLIST, 25, IVF_REORDER != 0);
+            gettimeofday(&tb1, NULL);
+            std::cerr << "[build] IVFIndex built"
+                      << " nlist=" << IVF_NLIST
+                      << " reorder=" << IVF_REORDER
+                      << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+            if (ivf_save(ivf_index, ivf_cache))
+                std::cerr << "[build] IVFIndex saved to " << ivf_cache << "\n";
+            else
+                std::cerr << "[build] WARNING: failed to save IVFIndex to " << ivf_cache << "\n";
+        }
+    }
 #endif
 
     // ── LUT build phase timing ────────────────────────────────────────────────

@@ -264,3 +264,106 @@ ivf_search_simd(const IVFIndex& idx, const float* base,
     }
     return heap;
 }
+
+
+// =============================================================================
+// ivf_save / ivf_load — persist and restore a built IVFIndex to/from disk
+//
+// Binary format (little-endian, native):
+//   [8 bytes each] nlist, vecdim, base_number, reordered
+//   centroids      : nlist × vecdim × float32
+//   invlists       : for each cluster c:
+//                      list_size (uint64), list_size × uint32_t
+//   if reordered:
+//     cluster_offset : (nlist+1) × uint64
+//     reordered_base : base_number × vecdim × float32
+//
+// Usage: call ivf_save after ivf_build, call ivf_load instead of ivf_build
+//        when the cache file exists.
+// =============================================================================
+
+// ivf_save — write IVFIndex to a binary cache file.
+// Returns true on success, false on I/O error.
+static bool ivf_save(const IVFIndex& idx, const char* path)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f) return false;
+
+    uint64_t hdr[4] = {
+        (uint64_t)idx.nlist,
+        (uint64_t)idx.vecdim,
+        (uint64_t)idx.base_number,
+        (uint64_t)(idx.reordered ? 1 : 0)
+    };
+    fwrite(hdr, sizeof(uint64_t), 4, f);
+
+    // centroids
+    fwrite(idx.centroids.data(), sizeof(float),
+           idx.nlist * idx.vecdim, f);
+
+    // invlists
+    for (size_t c = 0; c < idx.nlist; ++c) {
+        uint64_t sz = idx.invlists[c].size();
+        fwrite(&sz, sizeof(uint64_t), 1, f);
+        if (sz > 0)
+            fwrite(idx.invlists[c].data(), sizeof(uint32_t), sz, f);
+    }
+
+    if (idx.reordered) {
+        // cluster_offset: nlist+1 entries
+        for (size_t c = 0; c <= idx.nlist; ++c) {
+            uint64_t v = (uint64_t)idx.cluster_offset[c];
+            fwrite(&v, sizeof(uint64_t), 1, f);
+        }
+        // reordered_base
+        fwrite(idx.reordered_base.data(), sizeof(float),
+               idx.base_number * idx.vecdim, f);
+    }
+
+    fclose(f);
+    return true;
+}
+
+// ivf_load — read IVFIndex from a binary cache file.
+// Returns true on success, false if file is missing or malformed.
+static bool ivf_load(IVFIndex& idx, const char* path)
+{
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+
+    uint64_t hdr[4];
+    if (fread(hdr, sizeof(uint64_t), 4, f) != 4) { fclose(f); return false; }
+    idx.nlist       = (size_t)hdr[0];
+    idx.vecdim      = (size_t)hdr[1];
+    idx.base_number = (size_t)hdr[2];
+    idx.reordered   = (hdr[3] != 0);
+
+    // centroids
+    idx.centroids.resize(idx.nlist * idx.vecdim);
+    fread(idx.centroids.data(), sizeof(float), idx.nlist * idx.vecdim, f);
+
+    // invlists
+    idx.invlists.resize(idx.nlist);
+    for (size_t c = 0; c < idx.nlist; ++c) {
+        uint64_t sz = 0;
+        fread(&sz, sizeof(uint64_t), 1, f);
+        idx.invlists[c].resize((size_t)sz);
+        if (sz > 0)
+            fread(idx.invlists[c].data(), sizeof(uint32_t), sz, f);
+    }
+
+    if (idx.reordered) {
+        idx.cluster_offset.resize(idx.nlist + 1);
+        for (size_t c = 0; c <= idx.nlist; ++c) {
+            uint64_t v = 0;
+            fread(&v, sizeof(uint64_t), 1, f);
+            idx.cluster_offset[c] = (size_t)v;
+        }
+        idx.reordered_base.resize(idx.base_number * idx.vecdim);
+        fread(idx.reordered_base.data(), sizeof(float),
+              idx.base_number * idx.vecdim, f);
+    }
+
+    fclose(f);
+    return true;
+}
