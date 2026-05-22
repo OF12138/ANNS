@@ -94,8 +94,13 @@
 #define PQ_SCAN_QUERY_PTHREAD     20
 #define PQ_SCAN_QUERY_OMP         21
 //   ── IVF-SIMD baseline ────────────────────────────────────────────────────
-//   22  IVF_SIMD   ivf_search_simd()   two-phase: coarse centroid scan + fine NEON scan
+//   22  IVF_SIMD                 ivf_search_simd()               two-phase: coarse + fine NEON (single-thread)
+//   ── IVF-SIMD cluster-partition parallel ──────────────────────────────────
+//   23  IVF_SIMD_CLUSTER_PTHREAD ivf_search_simd_cluster_pthread() fine-scan split across Pthreads
+//        IVF_FLATTEN 0 = round-robin cluster assignment (non-uniform load)
+//        IVF_FLATTEN 1 = flatten vector list, split evenly (default, balanced)
 #define IVF_SIMD                  22
+#define IVF_SIMD_CLUSTER_PTHREAD  23
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -105,13 +110,15 @@
 #define BUILD_PQ     PQ_BUILD_SIMD
 #define COARSE_P     200
 // Number of Pthread worker threads (used by SEARCH_ALG 14 and 15).
-// IVF parameters (used by SEARCH_ALG 22):
+// IVF parameters (used by SEARCH_ALG 22–23):
 //   IVF_NLIST   : number of clusters (64–4096; sqrt(100K) ≈ 316, use 256 or 512)
 //   IVF_NPROBE  : clusters scanned per query (latency-recall knob; sweep 1–nlist)
 //   IVF_REORDER : 0 = original layout (random access), 1 = cluster-contiguous layout
+//   IVF_FLATTEN : (SEARCH_ALG 23 only) 0 = cluster-split, 1 = flatten-then-split
 #define IVF_NLIST    1024
 #define IVF_NPROBE   16
 #define IVF_REORDER  0
+#define IVF_FLATTEN  1
 // Server has 8 cores; 7 workers + 1 main thread = full utilisation.
 #define FLAT_PTHREAD_THREADS   7
 // ─────────────────────────────────────────────────────────────────────────────
@@ -142,6 +149,7 @@
 #include "ARM/Alg_parallel/pq_flat_simd_lut_parallel.h"
 #include "ARM/Alg_parallel/pq_flat_simd_scan_parallel.h"
 #include "ARM/Alg_parallel/ivf_flat_simd.h"
+#include "ARM/Alg_parallel/ivf_flat_simd_parallel.h"
 
 using namespace hnswlib;
 
@@ -233,6 +241,7 @@ int main(int argc, char *argv[])
         "pq_batch_scan_rerank_pthread (pthread, query-parallel scan+rerank)",     // 20
         "pq_batch_scan_rerank_omp     (omp,    query-parallel scan+rerank)",      // 21
         "ivf_search_simd (IVF coarse+fine, NEON IP)",                             // 22
+        "ivf_search_simd_cluster_pthread (IVF cluster-partition parallel)",       // 23
     };
     static const char* build_names[] = {
         "",
@@ -252,14 +261,18 @@ int main(int argc, char *argv[])
 #if SEARCH_ALG == FLAT_SIMD_QUERY_PTHREAD || SEARCH_ALG == FLAT_SIMD_BASE_PTHREAD \
  || SEARCH_ALG == FLAT_SIMD_QUERY_OMP     || SEARCH_ALG == FLAT_SIMD_BASE_OMP    \
  || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP   \
- || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
+ || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP     \
+ || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
     std::cerr << "[config] threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
-#if SEARCH_ALG == IVF_SIMD
+#if SEARCH_ALG == IVF_SIMD || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
     std::cerr << "[config] ivf_nlist="   << IVF_NLIST
               << "  ivf_nprobe=" << IVF_NPROBE
               << "  ivf_reorder=" << IVF_REORDER << "\n";
+#endif
+#if SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
+    std::cerr << "[config] ivf_flatten=" << IVF_FLATTEN << "\n";
 #endif
     std::cerr << "========================================\n";
 
@@ -314,7 +327,7 @@ int main(int argc, char *argv[])
 #endif
 #endif
 
-#if SEARCH_ALG == IVF_SIMD
+#if SEARCH_ALG == IVF_SIMD || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
     IVFIndex ivf_index;
     {
         char ivf_cache[256];
@@ -571,8 +584,12 @@ int main(int argc, char *argv[])
 #elif SEARCH_ALG == IVF_SIMD
         auto res = ivf_search_simd(ivf_index, base,
                                    test_query + i*vecdim, k, IVF_NPROBE);
+#elif SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
+        auto res = ivf_search_simd_cluster_pthread(ivf_index, base,
+                                   test_query + i*vecdim, k, IVF_NPROBE,
+                                   FLAT_PTHREAD_THREADS);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–22)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–23)."
 #endif
 
         gettimeofday(&newVal, NULL);
