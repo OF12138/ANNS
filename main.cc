@@ -529,6 +529,9 @@ int main(int argc, char *argv[])
     }
 #endif
 
+#if SEARCH_ALG == IVF_SIMD
+    int64_t ivf_t_coarse = 0, ivf_t_scan = 0;
+#endif
 #if SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
     int64_t ivf_t_coarse = 0, ivf_t_scan = 0, ivf_t_merge = 0;
 #endif
@@ -586,8 +589,9 @@ int main(int argc, char *argv[])
         // Results computed in parallel batch above; move out for recall eval.
         auto res = std::move(pq_scan_results[i]);
 #elif SEARCH_ALG == IVF_SIMD
-        auto res = ivf_search_simd(ivf_index, base,
-                                   test_query + i*vecdim, k, IVF_NPROBE);
+        auto res = ivf_search_simd_timed(ivf_index, base,
+                                   test_query + i*vecdim, k, IVF_NPROBE,
+                                   &ivf_t_coarse, &ivf_t_scan);
 #elif SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
         auto res = ivf_search_simd_cluster_pthread_timed(ivf_index, base,
                                    test_query + i*vecdim, k, IVF_NPROBE,
@@ -621,6 +625,19 @@ int main(int argc, char *argv[])
         results[i] = {(float)acc / k, diff};
     }
 
+#if SEARCH_ALG == IVF_SIMD
+    {
+        double n = (double)test_number;
+        double avg_coarse = ivf_t_coarse / n;
+        double avg_scan   = ivf_t_scan   / n;
+        double avg_total  = avg_coarse + avg_scan;
+        std::cerr << "[phase] avg coarse (centroid rank): " << avg_coarse << " us  ("
+                  << (avg_coarse / avg_total * 100.0) << "%)\n";
+        std::cerr << "[phase] avg scan   (fine vectors):  " << avg_scan   << " us  ("
+                  << (avg_scan   / avg_total * 100.0) << "%)\n";
+        std::cerr << "[phase] avg total  (2 phases):      " << avg_total  << " us\n";
+    }
+#endif
 #if SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
     {
         double n = (double)test_number;

@@ -32,6 +32,7 @@
 // Compile:     g++ main.cc -o main -O2 -fopenmp -lpthread -std=c++11
 // =============================================================================
 #pragma once
+#include <sys/time.h>
 #include <arm_neon.h>
 #include <queue>
 #include <utility>
@@ -262,6 +263,83 @@ ivf_search_simd(const IVFIndex& idx, const float* base,
             }
         }
     }
+    return heap;
+}
+
+
+// =============================================================================
+// ivf_search_simd_timed — same as ivf_search_simd with per-phase timing
+//
+// Accumulates wall-clock µs into two caller-owned counters:
+//   t_coarse_us : centroid IP computation + partial_sort (Phase 1)
+//   t_scan_us   : exact NEON IP over selected cluster vectors (Phase 2)
+//
+// Counters are *added to* on each call; divide by test_number for per-query avg.
+// =============================================================================
+std::priority_queue<std::pair<float, uint32_t>>
+ivf_search_simd_timed(const IVFIndex& idx, const float* base,
+                      const float* query, size_t k, size_t nprobe,
+                      int64_t* t_coarse_us, int64_t* t_scan_us)
+{
+    struct timeval tp0, tp1;
+    const size_t d  = idx.vecdim;
+    const size_t np = std::min(nprobe, idx.nlist);
+
+    // ── Phase 1: Coarse ───────────────────────────────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::vector<std::pair<float, uint32_t>> coarse(idx.nlist);
+    for (size_t c = 0; c < idx.nlist; ++c) {
+        float ip = simd_inner_product_neon_unroll(
+            idx.centroids.data() + c * d, query, d);
+        coarse[c] = {1.0f - ip, static_cast<uint32_t>(c)};
+    }
+    std::partial_sort(coarse.begin(), coarse.begin() + np, coarse.end());
+    gettimeofday(&tp1, NULL);
+    *t_coarse_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                  - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    // ── Phase 2: Fine scan ────────────────────────────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::priority_queue<std::pair<float, uint32_t>> heap;
+
+    if (idx.reordered) {
+        for (size_t probe = 0; probe < np; ++probe) {
+            uint32_t c     = coarse[probe].second;
+            size_t   start = idx.cluster_offset[c];
+            size_t   end   = idx.cluster_offset[c + 1];
+            for (size_t j = start; j < end; ++j) {
+                float ip  = simd_inner_product_neon_unroll(
+                    idx.reordered_base.data() + j * d, query, d);
+                float dis = 1.0f - ip;
+                uint32_t orig = idx.invlists[c][j - start];
+                if (heap.size() < k) {
+                    heap.push({dis, orig});
+                } else if (dis < heap.top().first) {
+                    heap.push({dis, orig});
+                    heap.pop();
+                }
+            }
+        }
+    } else {
+        for (size_t probe = 0; probe < np; ++probe) {
+            uint32_t c = coarse[probe].second;
+            for (uint32_t orig : idx.invlists[c]) {
+                float ip  = simd_inner_product_neon_unroll(
+                    base + (size_t)orig * d, query, d);
+                float dis = 1.0f - ip;
+                if (heap.size() < k) {
+                    heap.push({dis, orig});
+                } else if (dis < heap.top().first) {
+                    heap.push({dis, orig});
+                    heap.pop();
+                }
+            }
+        }
+    }
+    gettimeofday(&tp1, NULL);
+    *t_scan_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
     return heap;
 }
 
