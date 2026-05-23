@@ -29,6 +29,7 @@
 #pragma once
 #include <sys/time.h>
 #include <pthread.h>
+#include <omp.h>
 #include <queue>
 #include <utility>
 #include <vector>
@@ -390,6 +391,287 @@ ivf_search_simd_cluster_pthread_timed(
                 result.push(top);
                 result.pop();
             }
+        }
+    }
+    gettimeofday(&tp1, NULL);
+    *t_merge_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                 - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    return result;
+}
+
+
+// =============================================================================
+// ivf_search_simd_cluster_omp
+//
+// Same two-phase IVF as the Pthread version but uses an OpenMP parallel region
+// for the fine scan.  OpenMP maintains a persistent thread pool so barrier
+// wakeup cost (~5–20 µs) is far lower than Pthread create/join (~350 µs).
+//
+// IVF_FLATTEN=0: each thread claims clusters at positions tid, tid+nth, ...
+// IVF_FLATTEN=1: flat vector list built single-threaded, then split evenly.
+//
+// Thread-local heaps are pre-allocated outside the parallel region so that
+// std::priority_queue construction does not occur inside the critical path.
+// =============================================================================
+std::priority_queue<std::pair<float, uint32_t>>
+ivf_search_simd_cluster_omp(
+    const IVFIndex& idx, const float* base,
+    const float* query, size_t k, size_t nprobe, int num_threads)
+{
+    const size_t d  = idx.vecdim;
+    const size_t np = std::min(nprobe, idx.nlist);
+
+    // ── Phase 1: Coarse (single-thread) ──────────────────────────────────────
+    std::vector<std::pair<float, uint32_t>> coarse(idx.nlist);
+    for (size_t c = 0; c < idx.nlist; ++c) {
+        float ip = simd_inner_product_neon_unroll(
+            idx.centroids.data() + c * d, query, d);
+        coarse[c] = {1.0f - ip, static_cast<uint32_t>(c)};
+    }
+    std::partial_sort(coarse.begin(), coarse.begin() + np, coarse.end());
+
+    std::vector<uint32_t> probe_ids(np);
+    for (size_t i = 0; i < np; ++i) probe_ids[i] = coarse[i].second;
+
+    // ── Phase 2: Fine (parallel via OMP) ─────────────────────────────────────
+    std::vector<std::priority_queue<std::pair<float, uint32_t>>>
+        local_heaps(num_threads);
+
+#if IVF_FLATTEN
+    size_t total = 0;
+    for (size_t i = 0; i < np; ++i)
+        total += idx.invlists[probe_ids[i]].size();
+
+    std::vector<uint32_t> flat_ids;
+    std::vector<size_t>   flat_pos;
+    flat_ids.reserve(total);
+    if (idx.reordered) flat_pos.reserve(total);
+
+    for (size_t i = 0; i < np; ++i) {
+        uint32_t c = probe_ids[i];
+        const size_t base_pos = idx.reordered ? idx.cluster_offset[c] : 0;
+        for (size_t j = 0; j < idx.invlists[c].size(); ++j) {
+            flat_ids.push_back(idx.invlists[c][j]);
+            if (idx.reordered) flat_pos.push_back(base_pos + j);
+        }
+    }
+
+    const size_t chunk = (total + (size_t)num_threads - 1) / (size_t)num_threads;
+    const size_t* fp   = idx.reordered ? flat_pos.data() : nullptr;
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int    tid     = omp_get_thread_num();
+        size_t f_start = std::min((size_t)tid * chunk, total);
+        size_t f_end   = std::min(f_start + chunk, total);
+        auto&  heap    = local_heaps[tid];
+
+        if (fp != nullptr) {
+            for (size_t j = f_start; j < f_end; ++j) {
+                size_t   pos  = fp[j];
+                uint32_t orig = flat_ids[j];
+                float ip  = simd_inner_product_neon_unroll(
+                    idx.reordered_base.data() + pos * d, query, d);
+                float dis = 1.0f - ip;
+                if (heap.size() < k)                   { heap.push({dis, orig}); }
+                else if (dis < heap.top().first)        { heap.push({dis, orig}); heap.pop(); }
+            }
+        } else {
+            for (size_t j = f_start; j < f_end; ++j) {
+                uint32_t orig = flat_ids[j];
+                float ip  = simd_inner_product_neon_unroll(
+                    base + (size_t)orig * d, query, d);
+                float dis = 1.0f - ip;
+                if (heap.size() < k)                   { heap.push({dis, orig}); }
+                else if (dis < heap.top().first)        { heap.push({dis, orig}); heap.pop(); }
+            }
+        }
+    }
+#else
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int    tid  = omp_get_thread_num();
+        int    nth  = omp_get_num_threads();
+        auto&  heap = local_heaps[tid];
+
+        for (size_t ci = (size_t)tid; ci < np; ci += (size_t)nth) {
+            uint32_t c = probe_ids[ci];
+            if (idx.reordered) {
+                size_t start = idx.cluster_offset[c];
+                size_t end   = idx.cluster_offset[c + 1];
+                for (size_t j = start; j < end; ++j) {
+                    float ip  = simd_inner_product_neon_unroll(
+                        idx.reordered_base.data() + j * d, query, d);
+                    float dis = 1.0f - ip;
+                    uint32_t orig = idx.invlists[c][j - start];
+                    if (heap.size() < k)                   { heap.push({dis, orig}); }
+                    else if (dis < heap.top().first)        { heap.push({dis, orig}); heap.pop(); }
+                }
+            } else {
+                for (uint32_t orig : idx.invlists[c]) {
+                    float ip  = simd_inner_product_neon_unroll(
+                        base + (size_t)orig * d, query, d);
+                    float dis = 1.0f - ip;
+                    if (heap.size() < k)                   { heap.push({dis, orig}); }
+                    else if (dis < heap.top().first)        { heap.push({dis, orig}); heap.pop(); }
+                }
+            }
+        }
+    }
+#endif
+
+    // ── Merge local heaps → global top-k ─────────────────────────────────────
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (int t = 0; t < num_threads; ++t) {
+        auto& lh = local_heaps[t];
+        while (!lh.empty()) {
+            auto top = lh.top(); lh.pop();
+            if (result.size() < k)                 { result.push(top); }
+            else if (top.first < result.top().first){ result.push(top); result.pop(); }
+        }
+    }
+    return result;
+}
+
+
+// =============================================================================
+// ivf_search_simd_cluster_omp_timed
+//
+// Timed variant of ivf_search_simd_cluster_omp.  Accumulates wall-clock µs
+// into three caller-owned counters:
+//
+//   t_coarse_us : centroid IP + partial_sort (Phase 1)
+//   t_scan_us   : flat-list build (if IVF_FLATTEN=1) + OMP parallel region
+//   t_merge_us  : merging local heaps into global top-k
+// =============================================================================
+std::priority_queue<std::pair<float, uint32_t>>
+ivf_search_simd_cluster_omp_timed(
+    const IVFIndex& idx, const float* base,
+    const float* query, size_t k, size_t nprobe, int num_threads,
+    int64_t* t_coarse_us, int64_t* t_scan_us, int64_t* t_merge_us)
+{
+    struct timeval tp0, tp1;
+    const size_t d  = idx.vecdim;
+    const size_t np = std::min(nprobe, idx.nlist);
+
+    // ── Phase 1: Coarse ───────────────────────────────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::vector<std::pair<float, uint32_t>> coarse(idx.nlist);
+    for (size_t c = 0; c < idx.nlist; ++c) {
+        float ip = simd_inner_product_neon_unroll(
+            idx.centroids.data() + c * d, query, d);
+        coarse[c] = {1.0f - ip, static_cast<uint32_t>(c)};
+    }
+    std::partial_sort(coarse.begin(), coarse.begin() + np, coarse.end());
+    gettimeofday(&tp1, NULL);
+    *t_coarse_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                  - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    std::vector<uint32_t> probe_ids(np);
+    for (size_t i = 0; i < np; ++i) probe_ids[i] = coarse[i].second;
+
+    // ── Phase 2: Scan ─────────────────────────────────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::vector<std::priority_queue<std::pair<float, uint32_t>>>
+        local_heaps(num_threads);
+
+#if IVF_FLATTEN
+    size_t total = 0;
+    for (size_t i = 0; i < np; ++i)
+        total += idx.invlists[probe_ids[i]].size();
+
+    std::vector<uint32_t> flat_ids;
+    std::vector<size_t>   flat_pos;
+    flat_ids.reserve(total);
+    if (idx.reordered) flat_pos.reserve(total);
+
+    for (size_t i = 0; i < np; ++i) {
+        uint32_t c = probe_ids[i];
+        const size_t base_pos = idx.reordered ? idx.cluster_offset[c] : 0;
+        for (size_t j = 0; j < idx.invlists[c].size(); ++j) {
+            flat_ids.push_back(idx.invlists[c][j]);
+            if (idx.reordered) flat_pos.push_back(base_pos + j);
+        }
+    }
+
+    const size_t chunk = (total + (size_t)num_threads - 1) / (size_t)num_threads;
+    const size_t* fp   = idx.reordered ? flat_pos.data() : nullptr;
+
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int    tid     = omp_get_thread_num();
+        size_t f_start = std::min((size_t)tid * chunk, total);
+        size_t f_end   = std::min(f_start + chunk, total);
+        auto&  heap    = local_heaps[tid];
+
+        if (fp != nullptr) {
+            for (size_t j = f_start; j < f_end; ++j) {
+                size_t   pos  = fp[j];
+                uint32_t orig = flat_ids[j];
+                float ip  = simd_inner_product_neon_unroll(
+                    idx.reordered_base.data() + pos * d, query, d);
+                float dis = 1.0f - ip;
+                if (heap.size() < k)                   { heap.push({dis, orig}); }
+                else if (dis < heap.top().first)        { heap.push({dis, orig}); heap.pop(); }
+            }
+        } else {
+            for (size_t j = f_start; j < f_end; ++j) {
+                uint32_t orig = flat_ids[j];
+                float ip  = simd_inner_product_neon_unroll(
+                    base + (size_t)orig * d, query, d);
+                float dis = 1.0f - ip;
+                if (heap.size() < k)                   { heap.push({dis, orig}); }
+                else if (dis < heap.top().first)        { heap.push({dis, orig}); heap.pop(); }
+            }
+        }
+    }
+#else
+    #pragma omp parallel num_threads(num_threads)
+    {
+        int    tid  = omp_get_thread_num();
+        int    nth  = omp_get_num_threads();
+        auto&  heap = local_heaps[tid];
+
+        for (size_t ci = (size_t)tid; ci < np; ci += (size_t)nth) {
+            uint32_t c = probe_ids[ci];
+            if (idx.reordered) {
+                size_t start = idx.cluster_offset[c];
+                size_t end   = idx.cluster_offset[c + 1];
+                for (size_t j = start; j < end; ++j) {
+                    float ip  = simd_inner_product_neon_unroll(
+                        idx.reordered_base.data() + j * d, query, d);
+                    float dis = 1.0f - ip;
+                    uint32_t orig = idx.invlists[c][j - start];
+                    if (heap.size() < k)                   { heap.push({dis, orig}); }
+                    else if (dis < heap.top().first)        { heap.push({dis, orig}); heap.pop(); }
+                }
+            } else {
+                for (uint32_t orig : idx.invlists[c]) {
+                    float ip  = simd_inner_product_neon_unroll(
+                        base + (size_t)orig * d, query, d);
+                    float dis = 1.0f - ip;
+                    if (heap.size() < k)                   { heap.push({dis, orig}); }
+                    else if (dis < heap.top().first)        { heap.push({dis, orig}); heap.pop(); }
+                }
+            }
+        }
+    }
+#endif
+
+    gettimeofday(&tp1, NULL);
+    *t_scan_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    // ── Phase 3: Merge local heaps → global top-k ────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (int t = 0; t < num_threads; ++t) {
+        auto& lh = local_heaps[t];
+        while (!lh.empty()) {
+            auto top = lh.top(); lh.pop();
+            if (result.size() < k)                  { result.push(top); }
+            else if (top.first < result.top().first) { result.push(top); result.pop(); }
         }
     }
     gettimeofday(&tp1, NULL);
