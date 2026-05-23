@@ -100,9 +100,12 @@
 //   24  IVF_SIMD_CLUSTER_OMP    ivf_search_simd_cluster_omp()    fine-scan split via OpenMP
 //        IVF_FLATTEN 0 = round-robin cluster assignment (non-uniform load)
 //        IVF_FLATTEN 1 = flatten vector list, split evenly (default, balanced)
-#define IVF_SIMD                  22
-#define IVF_SIMD_CLUSTER_PTHREAD  23
-#define IVF_SIMD_CLUSTER_OMP      24
+//   25  IVF_SIMD_CLUSTER_PTHREAD_DYN  ivf_search_simd_cluster_pthread_dynamic()
+//        cluster-level dynamic scheduling via atomic counter (no IVF_FLATTEN)
+#define IVF_SIMD                      22
+#define IVF_SIMD_CLUSTER_PTHREAD      23
+#define IVF_SIMD_CLUSTER_OMP          24
+#define IVF_SIMD_CLUSTER_PTHREAD_DYN  25
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -117,6 +120,7 @@
 //   IVF_NPROBE  : clusters scanned per query (latency-recall knob; sweep 1–nlist)
 //   IVF_REORDER : 0 = original layout (random access), 1 = cluster-contiguous layout
 //   IVF_FLATTEN : (SEARCH_ALG 23–24 only) 0 = cluster-split, 1 = flatten-then-split
+//                 (SEARCH_ALG 25 always uses dynamic cluster-level scheduling)
 #define IVF_NLIST    1024
 #define IVF_NPROBE   16
 #define IVF_REORDER  0
@@ -245,6 +249,7 @@ int main(int argc, char *argv[])
         "ivf_search_simd (IVF coarse+fine, NEON IP)",                             // 22
         "ivf_search_simd_cluster_pthread (IVF cluster-partition parallel, Pthread)", // 23
         "ivf_search_simd_cluster_omp    (IVF cluster-partition parallel, OMP)",    // 24
+        "ivf_search_simd_cluster_pthread_dynamic (IVF dynamic cluster scheduling, Pthread)", // 25
     };
     static const char* build_names[] = {
         "",
@@ -266,12 +271,14 @@ int main(int argc, char *argv[])
  || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP   \
  || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP     \
  || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD \
- || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP
+ || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP     \
+ || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD_DYN
     std::cerr << "[config] threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
 #if SEARCH_ALG == IVF_SIMD || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD \
- || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP
+ || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP   \
+ || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD_DYN
     std::cerr << "[config] ivf_nlist="   << IVF_NLIST
               << "  ivf_nprobe=" << IVF_NPROBE
               << "  ivf_reorder=" << IVF_REORDER << "\n";
@@ -333,7 +340,8 @@ int main(int argc, char *argv[])
 #endif
 
 #if SEARCH_ALG == IVF_SIMD || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD \
- || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP
+ || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP   \
+ || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD_DYN
     IVFIndex ivf_index;
     {
         char ivf_cache[256];
@@ -545,6 +553,10 @@ int main(int argc, char *argv[])
 #if SEARCH_ALG == IVF_SIMD_CLUSTER_OMP
     int64_t ivf_t_coarse = 0, ivf_t_scan = 0, ivf_t_merge = 0;
 #endif
+#if SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD_DYN
+    int64_t ivf_t_coarse = 0, ivf_t_scan = 0, ivf_t_merge = 0;
+    int64_t ivf_t_create = 0, ivf_t_join  = 0;
+#endif
 
     // ── Query loop ────────────────────────────────────────────────────────────
     for(int i = 0; i < (int)test_number; ++i)
@@ -613,8 +625,14 @@ int main(int argc, char *argv[])
                                    test_query + i*vecdim, k, IVF_NPROBE,
                                    FLAT_PTHREAD_THREADS,
                                    &ivf_t_coarse, &ivf_t_scan, &ivf_t_merge);
+#elif SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD_DYN
+        auto res = ivf_search_simd_cluster_pthread_dynamic_timed(ivf_index, base,
+                                   test_query + i*vecdim, k, IVF_NPROBE,
+                                   FLAT_PTHREAD_THREADS,
+                                   &ivf_t_coarse, &ivf_t_scan, &ivf_t_merge,
+                                   &ivf_t_create, &ivf_t_join);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–24)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–25)."
 #endif
 
         gettimeofday(&newVal, NULL);
@@ -690,6 +708,26 @@ int main(int argc, char *argv[])
         std::cerr << "[phase] avg merge  (heap merge):     " << avg_merge  << " us  ("
                   << (avg_merge  / avg_total * 100.0) << "%)\n";
         std::cerr << "[phase] avg total  (3 phases):       " << avg_total  << " us\n";
+    }
+#endif
+#if SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD_DYN
+    {
+        double n = (double)test_number;
+        double avg_coarse = ivf_t_coarse / n;
+        double avg_scan   = ivf_t_scan   / n;
+        double avg_merge  = ivf_t_merge  / n;
+        double avg_create = ivf_t_create / n;
+        double avg_join   = ivf_t_join   / n;
+        double avg_total  = avg_coarse + avg_scan + avg_merge;
+        std::cerr << "[phase] avg coarse  (centroid rank):  " << avg_coarse << " us  ("
+                  << (avg_coarse / avg_total * 100.0) << "%)\n";
+        std::cerr << "[phase] avg scan    (total Phase 2):  " << avg_scan   << " us  ("
+                  << (avg_scan   / avg_total * 100.0) << "%)\n";
+        std::cerr << "[phase]   create    (pthread_create): " << avg_create << " us\n";
+        std::cerr << "[phase]   join      (dynamic work):   " << avg_join   << " us\n";
+        std::cerr << "[phase] avg merge   (heap merge):     " << avg_merge  << " us  ("
+                  << (avg_merge  / avg_total * 100.0) << "%)\n";
+        std::cerr << "[phase] avg total   (3 phases):       " << avg_total  << " us\n";
     }
 #endif
 

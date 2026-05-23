@@ -680,3 +680,237 @@ ivf_search_simd_cluster_omp_timed(
 
     return result;
 }
+
+
+// =============================================================================
+// ivf_search_simd_cluster_pthread_dynamic  (SEARCH_ALG 25)
+//
+// Replaces the static round-robin cluster assignment of SEARCH_ALG 23 with a
+// DYNAMIC work queue using a mutex-protected counter:
+//
+//   Shared:   _IVFDynQueue { pthread_mutex_t mu; int next_ci; }
+//   Thread t: lock → ci = next_ci++ → unlock → scan probe_ids[ci]
+//
+// A thread that finishes a tiny / empty cluster immediately grabs the next one,
+// so fast threads absorb the slack of slow threads — unlike round-robin which
+// leaves the slack unaddressed.
+//
+// Uses only pthread primitives (already linked by -lpthread): no <atomic>,
+// no libatomic dependency.
+//
+// Granularity: one cluster per task (no flat-list build, no extra allocation).
+// At nprobe=16 (16 tasks, 7 threads) each thread gets ~2-3 tasks; residual
+// imbalance is bounded by one cluster's size difference.
+// At nprobe=64 (64 tasks, 7 threads) each thread gets ~9 tasks; near-perfect
+// balance expected.
+// =============================================================================
+
+struct _IVFDynQueue {
+    pthread_mutex_t mu;
+    int             next_ci;
+    int             nprobe;
+    const uint32_t* probe_ids;
+};
+
+struct _IVFDynWorkerArgs {
+    const IVFIndex* idx;
+    const float*    base;
+    const float*    query;
+    size_t          d;
+    size_t          k;
+    _IVFDynQueue*   queue;   // shared work queue
+    std::priority_queue<std::pair<float, uint32_t>> local_heap;
+};
+
+static void* _ivf_dyn_worker(void* arg)
+{
+    auto* a             = static_cast<_IVFDynWorkerArgs*>(arg);
+    auto& heap          = a->local_heap;
+    const float*     q  = a->query;
+    const size_t     d  = a->d;
+    const size_t     k  = a->k;
+    const IVFIndex& idx = *a->idx;
+    _IVFDynQueue*   Q   = a->queue;
+
+    while (true) {
+        pthread_mutex_lock(&Q->mu);
+        int ci = Q->next_ci;
+        if (ci >= Q->nprobe) { pthread_mutex_unlock(&Q->mu); break; }
+        Q->next_ci = ci + 1;
+        pthread_mutex_unlock(&Q->mu);
+
+        uint32_t c = Q->probe_ids[ci];
+
+        if (idx.reordered) {
+            size_t start = idx.cluster_offset[c];
+            size_t end   = idx.cluster_offset[c + 1];
+            for (size_t j = start; j < end; ++j) {
+                float ip  = simd_inner_product_neon_unroll(
+                    idx.reordered_base.data() + j * d, q, d);
+                float dis = 1.0f - ip;
+                uint32_t orig = idx.invlists[c][j - start];
+                if (heap.size() < k)             { heap.push({dis, orig}); }
+                else if (dis < heap.top().first) { heap.push({dis, orig}); heap.pop(); }
+            }
+        } else {
+            for (uint32_t orig : idx.invlists[c]) {
+                float ip  = simd_inner_product_neon_unroll(
+                    a->base + (size_t)orig * d, q, d);
+                float dis = 1.0f - ip;
+                if (heap.size() < k)             { heap.push({dis, orig}); }
+                else if (dis < heap.top().first) { heap.push({dis, orig}); heap.pop(); }
+            }
+        }
+    }
+    return nullptr;
+}
+
+std::priority_queue<std::pair<float, uint32_t>>
+ivf_search_simd_cluster_pthread_dynamic(
+    const IVFIndex& idx, const float* base,
+    const float* query, size_t k, size_t nprobe, int num_threads)
+{
+    const size_t d  = idx.vecdim;
+    const size_t np = std::min(nprobe, idx.nlist);
+
+    // ── Phase 1: Coarse (single-thread) ──────────────────────────────────────
+    std::vector<std::pair<float, uint32_t>> coarse(idx.nlist);
+    for (size_t c = 0; c < idx.nlist; ++c) {
+        float ip = simd_inner_product_neon_unroll(
+            idx.centroids.data() + c * d, query, d);
+        coarse[c] = {1.0f - ip, static_cast<uint32_t>(c)};
+    }
+    std::partial_sort(coarse.begin(), coarse.begin() + np, coarse.end());
+
+    std::vector<uint32_t> probe_ids(np);
+    for (size_t i = 0; i < np; ++i) probe_ids[i] = coarse[i].second;
+
+    // ── Phase 2: Fine (parallel, dynamic scheduling) ─────────────────────────
+    _IVFDynQueue queue;
+    pthread_mutex_init(&queue.mu, nullptr);
+    queue.next_ci   = 0;
+    queue.nprobe    = (int)np;
+    queue.probe_ids = probe_ids.data();
+
+    std::vector<pthread_t>         tids(num_threads);
+    std::vector<_IVFDynWorkerArgs> args(num_threads);
+
+    for (int t = 0; t < num_threads; ++t) {
+        args[t].idx   = &idx;
+        args[t].base  = base;
+        args[t].query = query;
+        args[t].d     = d;
+        args[t].k     = k;
+        args[t].queue = &queue;
+        pthread_create(&tids[t], nullptr, _ivf_dyn_worker, &args[t]);
+    }
+
+    for (int t = 0; t < num_threads; ++t) pthread_join(tids[t], nullptr);
+    pthread_mutex_destroy(&queue.mu);
+
+    // ── Phase 3: Merge ───────────────────────────────────────────────────────
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (int t = 0; t < num_threads; ++t) {
+        auto& lh = args[t].local_heap;
+        while (!lh.empty()) {
+            auto top = lh.top(); lh.pop();
+            if (result.size() < k)                   { result.push(top); }
+            else if (top.first < result.top().first)  { result.push(top); result.pop(); }
+        }
+    }
+    return result;
+}
+
+
+// =============================================================================
+// ivf_search_simd_cluster_pthread_dynamic_timed
+//
+// Timed variant: same accumulators as the static Pthread version —
+//   t_coarse_us  centroid IP + partial_sort (Phase 1)
+//   t_scan_us    pthread_create + dynamic work + pthread_join (Phase 2 total)
+//   t_merge_us   heap merge (Phase 3)
+//   t_create_us  pthread_create loop only
+//   t_join_us    pthread_join loop wall time (~parallel work duration)
+// =============================================================================
+std::priority_queue<std::pair<float, uint32_t>>
+ivf_search_simd_cluster_pthread_dynamic_timed(
+    const IVFIndex& idx, const float* base,
+    const float* query, size_t k, size_t nprobe, int num_threads,
+    int64_t* t_coarse_us, int64_t* t_scan_us, int64_t* t_merge_us,
+    int64_t* t_create_us, int64_t* t_join_us)
+{
+    struct timeval tp0, tp1, tc0, tc1, tj0, tj1;
+    const size_t d  = idx.vecdim;
+    const size_t np = std::min(nprobe, idx.nlist);
+
+    // ── Phase 1: Coarse ───────────────────────────────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::vector<std::pair<float, uint32_t>> coarse(idx.nlist);
+    for (size_t c = 0; c < idx.nlist; ++c) {
+        float ip = simd_inner_product_neon_unroll(
+            idx.centroids.data() + c * d, query, d);
+        coarse[c] = {1.0f - ip, static_cast<uint32_t>(c)};
+    }
+    std::partial_sort(coarse.begin(), coarse.begin() + np, coarse.end());
+    gettimeofday(&tp1, NULL);
+    *t_coarse_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                  - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    std::vector<uint32_t> probe_ids(np);
+    for (size_t i = 0; i < np; ++i) probe_ids[i] = coarse[i].second;
+
+    // ── Phase 2: Fine (parallel, dynamic scheduling) ─────────────────────────
+    gettimeofday(&tp0, NULL);
+
+    _IVFDynQueue queue;
+    pthread_mutex_init(&queue.mu, nullptr);
+    queue.next_ci   = 0;
+    queue.nprobe    = (int)np;
+    queue.probe_ids = probe_ids.data();
+
+    std::vector<pthread_t>         tids(num_threads);
+    std::vector<_IVFDynWorkerArgs> args(num_threads);
+
+    gettimeofday(&tc0, NULL);
+    for (int t = 0; t < num_threads; ++t) {
+        args[t].idx   = &idx;
+        args[t].base  = base;
+        args[t].query = query;
+        args[t].d     = d;
+        args[t].k     = k;
+        args[t].queue = &queue;
+        pthread_create(&tids[t], nullptr, _ivf_dyn_worker, &args[t]);
+    }
+    gettimeofday(&tc1, NULL);
+    *t_create_us += (tc1.tv_sec * 1000000LL + tc1.tv_usec)
+                  - (tc0.tv_sec * 1000000LL + tc0.tv_usec);
+
+    gettimeofday(&tj0, NULL);
+    for (int t = 0; t < num_threads; ++t) pthread_join(tids[t], nullptr);
+    gettimeofday(&tj1, NULL);
+    *t_join_us += (tj1.tv_sec * 1000000LL + tj1.tv_usec)
+                - (tj0.tv_sec * 1000000LL + tj0.tv_usec);
+
+    pthread_mutex_destroy(&queue.mu);
+
+    gettimeofday(&tp1, NULL);
+    *t_scan_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    // ── Phase 3: Merge ───────────────────────────────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (int t = 0; t < num_threads; ++t) {
+        auto& lh = args[t].local_heap;
+        while (!lh.empty()) {
+            auto top = lh.top(); lh.pop();
+            if (result.size() < k)                   { result.push(top); }
+            else if (top.first < result.top().first)  { result.push(top); result.pop(); }
+        }
+    }
+    gettimeofday(&tp1, NULL);
+    *t_merge_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                 - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    return result;
+}
