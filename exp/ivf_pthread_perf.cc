@@ -262,7 +262,7 @@ int main(int argc, char** argv)
         std::cerr << "[build] loaded from cache " << cache_path
                   << "  (" << tv_diff_us(tb0, tb1) / 1000 << " ms)\n";
     } else {
-        ivf_build(idx, base, base_number, vecdim, IVF_NLIST, IVF_REORDER);
+        ivf_build(idx, base, base_number, vecdim, IVF_NLIST, 25, IVF_REORDER != 0);
         gettimeofday(&tb1, NULL);
         std::cerr << "[build] built IVFIndex  ("
                   << tv_diff_us(tb0, tb1) / 1000 << " ms)\n";
