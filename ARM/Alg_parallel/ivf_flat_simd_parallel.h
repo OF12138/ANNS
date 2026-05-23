@@ -282,7 +282,8 @@ std::priority_queue<std::pair<float, uint32_t>>
 ivf_search_simd_cluster_pthread_timed(
     const IVFIndex& idx, const float* base,
     const float* query, size_t k, size_t nprobe, int num_threads,
-    int64_t* t_coarse_us, int64_t* t_scan_us, int64_t* t_merge_us)
+    int64_t* t_coarse_us, int64_t* t_scan_us, int64_t* t_merge_us,
+    int64_t* t_create_us, int64_t* t_join_us)
 {
     struct timeval tp0, tp1;
     const size_t d  = idx.vecdim;
@@ -329,6 +330,8 @@ ivf_search_simd_cluster_pthread_timed(
     }
 
     size_t chunk = (total + (size_t)num_threads - 1) / (size_t)num_threads;
+    struct timeval tc0, tc1, tj0, tj1;
+    gettimeofday(&tc0, NULL);
     for (int t = 0; t < num_threads; ++t) {
         args[t].idx      = &idx;
         args[t].base     = base;
@@ -341,7 +344,12 @@ ivf_search_simd_cluster_pthread_timed(
         args[t].f_end    = std::min((size_t)(t + 1) * chunk, total);
         pthread_create(&tids[t], nullptr, _ivf_cluster_worker, &args[t]);
     }
+    gettimeofday(&tc1, NULL);
+    *t_create_us += (tc1.tv_sec * 1000000LL + tc1.tv_usec)
+                  - (tc0.tv_sec * 1000000LL + tc0.tv_usec);
 #else
+    struct timeval tc0, tc1, tj0, tj1;
+    gettimeofday(&tc0, NULL);
     for (int t = 0; t < num_threads; ++t) {
         args[t].idx       = &idx;
         args[t].base      = base;
@@ -354,9 +362,17 @@ ivf_search_simd_cluster_pthread_timed(
         args[t].nth       = num_threads;
         pthread_create(&tids[t], nullptr, _ivf_cluster_worker, &args[t]);
     }
+    gettimeofday(&tc1, NULL);
+    *t_create_us += (tc1.tv_sec * 1000000LL + tc1.tv_usec)
+                  - (tc0.tv_sec * 1000000LL + tc0.tv_usec);
 #endif
 
+    gettimeofday(&tj0, NULL);
     for (int t = 0; t < num_threads; ++t) pthread_join(tids[t], nullptr);
+    gettimeofday(&tj1, NULL);
+    *t_join_us += (tj1.tv_sec * 1000000LL + tj1.tv_usec)
+                - (tj0.tv_sec * 1000000LL + tj0.tv_usec);
+
     gettimeofday(&tp1, NULL);
     *t_scan_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
                 - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
