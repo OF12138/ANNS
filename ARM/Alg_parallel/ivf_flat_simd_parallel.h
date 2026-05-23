@@ -64,6 +64,7 @@ struct _IVFWorkerArgs {
 
     // IVF_FLATTEN == 1: flatten fields
     const uint32_t* flat_ids;    // original vector IDs from all selected clusters
+    const size_t*   flat_pos;    // reordered_base slot positions (null if not reordered)
     size_t          f_start;     // inclusive
     size_t          f_end;       // exclusive
 
@@ -82,15 +83,34 @@ static void* _ivf_cluster_worker(void* arg)
 
 #if IVF_FLATTEN
     // ── Flatten mode: scan a contiguous slice of the flat vector ID array ─────
-    for (size_t j = a->f_start; j < a->f_end; ++j) {
-        uint32_t orig = a->flat_ids[j];
-        float ip  = simd_inner_product_neon_unroll(a->base + (size_t)orig * d, q, d);
-        float dis = 1.0f - ip;
-        if (heap.size() < k) {
-            heap.push({dis, orig});
-        } else if (dis < heap.top().first) {
-            heap.push({dis, orig});
-            heap.pop();
+    if (a->flat_pos != nullptr) {
+        // reordered: use sequential reordered_base access (cache-friendly)
+        for (size_t j = a->f_start; j < a->f_end; ++j) {
+            size_t   pos  = a->flat_pos[j];
+            uint32_t orig = a->flat_ids[j];
+            float ip  = simd_inner_product_neon_unroll(
+                idx.reordered_base.data() + pos * d, q, d);
+            float dis = 1.0f - ip;
+            if (heap.size() < k) {
+                heap.push({dis, orig});
+            } else if (dis < heap.top().first) {
+                heap.push({dis, orig});
+                heap.pop();
+            }
+        }
+    } else {
+        // non-reordered: random access into original base
+        for (size_t j = a->f_start; j < a->f_end; ++j) {
+            uint32_t orig = a->flat_ids[j];
+            float ip  = simd_inner_product_neon_unroll(
+                a->base + (size_t)orig * d, q, d);
+            float dis = 1.0f - ip;
+            if (heap.size() < k) {
+                heap.push({dis, orig});
+            } else if (dis < heap.top().first) {
+                heap.push({dis, orig});
+                heap.pop();
+            }
         }
     }
 #else
@@ -184,10 +204,18 @@ ivf_search_simd_cluster_pthread(
         total += idx.invlists[probe_ids[i]].size();
 
     std::vector<uint32_t> flat_ids;
+    std::vector<size_t>   flat_pos;   // reordered slot positions; empty when not reordered
     flat_ids.reserve(total);
-    for (size_t i = 0; i < np; ++i)
-        for (uint32_t orig : idx.invlists[probe_ids[i]])
-            flat_ids.push_back(orig);
+    if (idx.reordered) flat_pos.reserve(total);
+
+    for (size_t i = 0; i < np; ++i) {
+        uint32_t c = probe_ids[i];
+        const size_t base_pos = idx.reordered ? idx.cluster_offset[c] : 0;
+        for (size_t j = 0; j < idx.invlists[c].size(); ++j) {
+            flat_ids.push_back(idx.invlists[c][j]);
+            if (idx.reordered) flat_pos.push_back(base_pos + j);
+        }
+    }
 
     size_t chunk = (total + (size_t)num_threads - 1) / (size_t)num_threads;
     for (int t = 0; t < num_threads; ++t) {
@@ -197,6 +225,7 @@ ivf_search_simd_cluster_pthread(
         args[t].d        = d;
         args[t].k        = k;
         args[t].flat_ids = flat_ids.data();
+        args[t].flat_pos = idx.reordered ? flat_pos.data() : nullptr;
         args[t].f_start  = std::min((size_t)t * chunk, total);
         args[t].f_end    = std::min((size_t)(t + 1) * chunk, total);
         pthread_create(&tids[t], nullptr, _ivf_cluster_worker, &args[t]);
@@ -286,10 +315,18 @@ ivf_search_simd_cluster_pthread_timed(
         total += idx.invlists[probe_ids[i]].size();
 
     std::vector<uint32_t> flat_ids;
+    std::vector<size_t>   flat_pos;   // reordered slot positions; empty when not reordered
     flat_ids.reserve(total);
-    for (size_t i = 0; i < np; ++i)
-        for (uint32_t orig : idx.invlists[probe_ids[i]])
-            flat_ids.push_back(orig);
+    if (idx.reordered) flat_pos.reserve(total);
+
+    for (size_t i = 0; i < np; ++i) {
+        uint32_t c = probe_ids[i];
+        const size_t base_pos = idx.reordered ? idx.cluster_offset[c] : 0;
+        for (size_t j = 0; j < idx.invlists[c].size(); ++j) {
+            flat_ids.push_back(idx.invlists[c][j]);
+            if (idx.reordered) flat_pos.push_back(base_pos + j);
+        }
+    }
 
     size_t chunk = (total + (size_t)num_threads - 1) / (size_t)num_threads;
     for (int t = 0; t < num_threads; ++t) {
@@ -299,6 +336,7 @@ ivf_search_simd_cluster_pthread_timed(
         args[t].d        = d;
         args[t].k        = k;
         args[t].flat_ids = flat_ids.data();
+        args[t].flat_pos = idx.reordered ? flat_pos.data() : nullptr;
         args[t].f_start  = std::min((size_t)t * chunk, total);
         args[t].f_end    = std::min((size_t)(t + 1) * chunk, total);
         pthread_create(&tids[t], nullptr, _ivf_cluster_worker, &args[t]);
