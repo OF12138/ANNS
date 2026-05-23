@@ -529,6 +529,10 @@ int main(int argc, char *argv[])
     }
 #endif
 
+#if SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
+    int64_t ivf_t_coarse = 0, ivf_t_scan = 0, ivf_t_merge = 0;
+#endif
+
     // ── Query loop ────────────────────────────────────────────────────────────
     for(int i = 0; i < (int)test_number; ++i)
     {
@@ -585,9 +589,10 @@ int main(int argc, char *argv[])
         auto res = ivf_search_simd(ivf_index, base,
                                    test_query + i*vecdim, k, IVF_NPROBE);
 #elif SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
-        auto res = ivf_search_simd_cluster_pthread(ivf_index, base,
+        auto res = ivf_search_simd_cluster_pthread_timed(ivf_index, base,
                                    test_query + i*vecdim, k, IVF_NPROBE,
-                                   FLAT_PTHREAD_THREADS);
+                                   FLAT_PTHREAD_THREADS,
+                                   &ivf_t_coarse, &ivf_t_scan, &ivf_t_merge);
 #else
         #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–23)."
 #endif
@@ -615,6 +620,23 @@ int main(int argc, char *argv[])
         }
         results[i] = {(float)acc / k, diff};
     }
+
+#if SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD
+    {
+        double n = (double)test_number;
+        double avg_coarse = ivf_t_coarse / n;
+        double avg_scan   = ivf_t_scan   / n;
+        double avg_merge  = ivf_t_merge  / n;
+        double avg_total  = avg_coarse + avg_scan + avg_merge;
+        std::cerr << "[phase] avg coarse (centroid rank): " << avg_coarse << " us  ("
+                  << (avg_coarse / avg_total * 100.0) << "%)\n";
+        std::cerr << "[phase] avg scan   (thread work):   " << avg_scan   << " us  ("
+                  << (avg_scan   / avg_total * 100.0) << "%)\n";
+        std::cerr << "[phase] avg merge  (heap merge):    " << avg_merge  << " us  ("
+                  << (avg_merge  / avg_total * 100.0) << "%)\n";
+        std::cerr << "[phase] avg total  (3 phases):      " << avg_total  << " us\n";
+    }
+#endif
 
     // ── Report ────────────────────────────────────────────────────────────────
     float avg_recall = 0, avg_latency = 0;

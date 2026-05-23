@@ -27,6 +27,7 @@
 // Platform: AArch64. Compile: g++ main.cc -o main -O2 -fopenmp -lpthread -std=c++11
 // =============================================================================
 #pragma once
+#include <sys/time.h>
 #include <pthread.h>
 #include <queue>
 #include <utility>
@@ -231,5 +232,115 @@ ivf_search_simd_cluster_pthread(
             }
         }
     }
+    return result;
+}
+
+
+// =============================================================================
+// ivf_search_simd_cluster_pthread_timed
+//
+// Identical to ivf_search_simd_cluster_pthread but accumulates per-phase
+// wall-clock times into three caller-owned int64_t counters (in µs):
+//
+//   t_coarse_us : centroid IP computation + partial_sort (Phase 1, single-thread)
+//   t_scan_us   : flat-list build (if IVF_FLATTEN=1) + thread create/work/join
+//   t_merge_us  : merging num_threads local top-k heaps into the global top-k
+//
+// Accumulators are *added to* on each call so the caller can sum over all
+// queries and divide by test_number to obtain per-query averages.
+// =============================================================================
+std::priority_queue<std::pair<float, uint32_t>>
+ivf_search_simd_cluster_pthread_timed(
+    const IVFIndex& idx, const float* base,
+    const float* query, size_t k, size_t nprobe, int num_threads,
+    int64_t* t_coarse_us, int64_t* t_scan_us, int64_t* t_merge_us)
+{
+    struct timeval tp0, tp1;
+    const size_t d  = idx.vecdim;
+    const size_t np = std::min(nprobe, idx.nlist);
+
+    // ── Phase 1: Coarse ───────────────────────────────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::vector<std::pair<float, uint32_t>> coarse(idx.nlist);
+    for (size_t c = 0; c < idx.nlist; ++c) {
+        float ip = simd_inner_product_neon_unroll(
+            idx.centroids.data() + c * d, query, d);
+        coarse[c] = {1.0f - ip, static_cast<uint32_t>(c)};
+    }
+    std::partial_sort(coarse.begin(), coarse.begin() + np, coarse.end());
+    gettimeofday(&tp1, NULL);
+    *t_coarse_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                  - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    std::vector<uint32_t> probe_ids(np);
+    for (size_t i = 0; i < np; ++i) probe_ids[i] = coarse[i].second;
+
+    // ── Phase 2: Scan (flat-list build + thread create/work/join) ─────────────
+    gettimeofday(&tp0, NULL);
+    std::vector<pthread_t>      tids(num_threads);
+    std::vector<_IVFWorkerArgs> args(num_threads);
+
+#if IVF_FLATTEN
+    size_t total = 0;
+    for (size_t i = 0; i < np; ++i)
+        total += idx.invlists[probe_ids[i]].size();
+
+    std::vector<uint32_t> flat_ids;
+    flat_ids.reserve(total);
+    for (size_t i = 0; i < np; ++i)
+        for (uint32_t orig : idx.invlists[probe_ids[i]])
+            flat_ids.push_back(orig);
+
+    size_t chunk = (total + (size_t)num_threads - 1) / (size_t)num_threads;
+    for (int t = 0; t < num_threads; ++t) {
+        args[t].idx      = &idx;
+        args[t].base     = base;
+        args[t].query    = query;
+        args[t].d        = d;
+        args[t].k        = k;
+        args[t].flat_ids = flat_ids.data();
+        args[t].f_start  = std::min((size_t)t * chunk, total);
+        args[t].f_end    = std::min((size_t)(t + 1) * chunk, total);
+        pthread_create(&tids[t], nullptr, _ivf_cluster_worker, &args[t]);
+    }
+#else
+    for (int t = 0; t < num_threads; ++t) {
+        args[t].idx       = &idx;
+        args[t].base      = base;
+        args[t].query     = query;
+        args[t].d         = d;
+        args[t].k         = k;
+        args[t].probe_ids = probe_ids.data();
+        args[t].nprobe    = np;
+        args[t].tid       = t;
+        args[t].nth       = num_threads;
+        pthread_create(&tids[t], nullptr, _ivf_cluster_worker, &args[t]);
+    }
+#endif
+
+    for (int t = 0; t < num_threads; ++t) pthread_join(tids[t], nullptr);
+    gettimeofday(&tp1, NULL);
+    *t_scan_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
+    // ── Phase 3: Merge local heaps → global top-k ────────────────────────────
+    gettimeofday(&tp0, NULL);
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (int t = 0; t < num_threads; ++t) {
+        auto& lh = args[t].local_heap;
+        while (!lh.empty()) {
+            auto top = lh.top(); lh.pop();
+            if (result.size() < k) {
+                result.push(top);
+            } else if (top.first < result.top().first) {
+                result.push(top);
+                result.pop();
+            }
+        }
+    }
+    gettimeofday(&tp1, NULL);
+    *t_merge_us += (tp1.tv_sec * 1000000LL + tp1.tv_usec)
+                 - (tp0.tv_sec * 1000000LL + tp0.tv_usec);
+
     return result;
 }
