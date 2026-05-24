@@ -102,16 +102,15 @@ void ivfpq_batch_search_pthread(
     int remainder  = num_queries % T;
 
     int start = 0;
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < T; ++t) 
+    {
         int chunk  = base_chunk + (t < remainder ? 1 : 0);
         args[t]    = { &idx, base, queries, start, start + chunk,
                        vecdim, k, nprobe, p, results };
         start     += chunk;
         pthread_create(&tids[t], nullptr, _ivfpq_batch_worker, &args[t]);
     }
-
-    for (int t = 0; t < T; ++t)
-        pthread_join(tids[t], nullptr);
+    for (int t = 0; t < T; ++t) pthread_join(tids[t], nullptr);
 }
 
 

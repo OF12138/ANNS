@@ -117,6 +117,15 @@
 //   29  IVF_PQ_SIMD_OMP      ivfpq_batch_search_omp()
 //        Same query-split strategy via OpenMP schedule(static).
 //        Persistent thread pool avoids per-call pthread_create overhead.
+//   ── HNSW + NEON SIMD ─────────────────────────────────────────────────────
+//   30  HNSW_SIMD  hnsw_search_simd()
+//        Layer-0 only beam search.  Skips upper-layer greedy descent; starts
+//        directly from enterpoint_node_.  Distance function replaced with
+//        simd_inner_product_neon_unroll (4-accumulator NEON, vs. scalar fallback
+//        of InnerProductSpace on AArch64 where USE_SSE/USE_AVX are undefined).
+//        HNSW_M              : bidirectional links per node (default 16)
+//        HNSW_EF_CONSTRUCTION: beam width during build (default 200)
+//        HNSW_EF_SEARCH      : beam width during query (latency-recall knob)
 #define IVF_SIMD                      22
 #define IVF_SIMD_CLUSTER_PTHREAD      23
 #define IVF_SIMD_CLUSTER_OMP          24
@@ -125,6 +134,7 @@
 #define PQ_IVF_SIMD                   27
 #define IVF_PQ_SIMD_PTHREAD           28
 #define IVF_PQ_SIMD_OMP               29
+#define HNSW_SIMD                     30
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -149,6 +159,14 @@
 #define IVF_FLATTEN  1
 #define IVFPQ_M      8
 #define IVFPQ_K      256
+// HNSW parameters (used by SEARCH_ALG 30):
+//   HNSW_M              : bidirectional link count per node (default 16)
+//   HNSW_EF_CONSTRUCTION: beam width during build (default 200)
+//   HNSW_EF_SEARCH      : beam width during query; primary recall-latency knob
+//                         (sweep 10, 20, 50, 100, 200 for trade-off curve)
+#define HNSW_M                16
+#define HNSW_EF_CONSTRUCTION  200
+#define HNSW_EF_SEARCH        50
 // Server has 8 cores; 7 workers + 1 main thread = full utilisation.
 #define FLAT_PTHREAD_THREADS   7
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,6 +200,7 @@
 #include "ARM/Alg_parallel/ivf_flat_simd_parallel.h"
 #include "ARM/Alg_parallel/ivf_pq_simd.h"
 #include "ARM/Alg_parallel/ivf_pq_simd_parallel.h"
+#include "ARM/Alg_parallel/hnsw_simd.h"
 
 using namespace hnswlib;
 
@@ -280,6 +299,7 @@ int main(int argc, char *argv[])
         "pqivf_search_simd (PQ-first: global PQ, single LUT per query)",                    // 27
         "ivfpq_batch_search_pthread (IVF-PQ query-parallel, static Pthread partition)",     // 28
         "ivfpq_batch_search_omp    (IVF-PQ query-parallel, OpenMP schedule(static))",       // 29
+        "hnsw_search_simd (HNSW layer-0 beam search, NEON IP distance)",                    // 30
     };
     static const char* build_names[] = {
         "",
@@ -323,6 +343,11 @@ int main(int argc, char *argv[])
     std::cerr << "[config] ivf_nlist=" << IVF_NLIST
               << "  ivf_nprobe=" << IVF_NPROBE
               << "  M=" << IVFPQ_M << "  K=" << IVFPQ_K << "\n";
+#endif
+#if SEARCH_ALG == HNSW_SIMD
+    std::cerr << "[config] hnsw_M=" << HNSW_M
+              << "  ef_construction=" << HNSW_EF_CONSTRUCTION
+              << "  ef_search=" << HNSW_EF_SEARCH << "\n";
 #endif
     std::cerr << "========================================\n";
 
@@ -437,6 +462,37 @@ int main(int argc, char *argv[])
                 std::cerr << "[build] IVFPQIndex saved to " << ivfpq_cache << "\n";
             else
                 std::cerr << "[build] WARNING: failed to save IVFPQIndex\n";
+        }
+    }
+#endif
+
+#if SEARCH_ALG == HNSW_SIMD
+    InnerProductSpaceNEON hnsw_space(vecdim);
+    HierarchicalNSW<float>* hnsw_index = nullptr;
+    {
+        char hnsw_cache[256];
+        snprintf(hnsw_cache, sizeof(hnsw_cache),
+                 "files/hnsw_neon_M%d_efc%d.index", HNSW_M, HNSW_EF_CONSTRUCTION);
+        gettimeofday(&tb0, NULL);
+        try {
+            hnsw_index = new HierarchicalNSW<float>(
+                &hnsw_space, std::string(hnsw_cache), false, base_number);
+            gettimeofday(&tb1, NULL);
+            std::cerr << "[build] HNSW loaded from cache " << hnsw_cache
+                      << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+        } catch (...) {
+            hnsw_index = new HierarchicalNSW<float>(
+                &hnsw_space, base_number, HNSW_M, HNSW_EF_CONSTRUCTION);
+            hnsw_index->addPoint(base, 0);
+            #pragma omp parallel for
+            for (int i = 1; i < (int)base_number; ++i)
+                hnsw_index->addPoint(base + (size_t)i * vecdim, (size_t)i);
+            gettimeofday(&tb1, NULL);
+            std::cerr << "[build] HNSW built  M=" << HNSW_M
+                      << "  ef_construction=" << HNSW_EF_CONSTRUCTION
+                      << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+            hnsw_index->saveIndex(std::string(hnsw_cache));
+            std::cerr << "[build] HNSW saved to " << hnsw_cache << "\n";
         }
     }
 #endif
@@ -754,8 +810,10 @@ int main(int argc, char *argv[])
 #elif SEARCH_ALG == IVF_PQ_SIMD_PTHREAD || SEARCH_ALG == IVF_PQ_SIMD_OMP
         // Results computed in parallel batch above; move out for recall eval.
         auto res = std::move(ivfpq_batch[i]);
+#elif SEARCH_ALG == HNSW_SIMD
+        auto res = hnsw_search_simd(hnsw_index, test_query + i*vecdim, k, HNSW_EF_SEARCH);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–29)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–30)."
 #endif
 
         gettimeofday(&newVal, NULL);
