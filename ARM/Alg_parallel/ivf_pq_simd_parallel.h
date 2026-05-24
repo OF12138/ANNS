@@ -13,6 +13,12 @@
 //     No shared writes; no locks; no synchronization during search.
 //     Metric: batch throughput (queries/sec). Single-query latency unchanged.
 //
+//   ivfpq_batch_search_omp (SEARCH_ALG 29)
+//     Same query-split strategy, implemented with OpenMP.
+//     Uses a persistent thread pool (no per-call create/join overhead).
+//     schedule(static): uniform work per query (same nprobe for all) →
+//     static chunk assignment avoids dynamic scheduling overhead.
+//
 // Why no pre-flatten:
 //   Flattening the cluster vectors before splitting would only benefit
 //   intra-query fine-scan parallelism (each query scans ~3K vectors across
@@ -23,6 +29,7 @@
 // Compile:  g++ main.cc -o main -O2 -fopenmp -lpthread -std=c++11
 // =============================================================================
 #pragma once
+#include <omp.h>
 #include <pthread.h>
 #include <vector>
 #include <queue>
@@ -105,4 +112,34 @@ void ivfpq_batch_search_pthread(
 
     for (int t = 0; t < T; ++t)
         pthread_join(tids[t], nullptr);
+}
+
+
+// =============================================================================
+// ivfpq_batch_search_omp — OpenMP query-parallel IVF-PQ batch search
+//
+// Identical query-split strategy as ivfpq_batch_search_pthread but uses
+// OpenMP's persistent thread pool instead of per-call pthread_create/join.
+// This eliminates thread creation overhead, making it more efficient at
+// high thread counts or when called repeatedly.
+//
+// schedule(static): each query does identical work (same nprobe, same coarse
+// + fine pipeline), so static equal-chunk assignment has no load imbalance.
+//
+// Parameters: same as ivfpq_batch_search_pthread.
+// =============================================================================
+void ivfpq_batch_search_omp(
+    const IVFPQIndex& idx, const float* base,
+    const float* queries, int num_queries, size_t vecdim,
+    size_t k, size_t nprobe, size_t p,
+    std::priority_queue<std::pair<float, uint32_t>>* results,
+    int num_threads)
+{
+    #pragma omp parallel for schedule(static) num_threads(num_threads)
+    for (int i = 0; i < num_queries; ++i) {
+        results[i] = ivfpq_search_simd(
+            idx, base,
+            queries + (size_t)i * vecdim,
+            k, nprobe, p);
+    }
 }

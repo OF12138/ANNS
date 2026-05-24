@@ -114,6 +114,9 @@
 //        Each thread calls ivfpq_search_simd on its slice (no pre-flatten).
 //        Metric: batch throughput. Uses IVF_NLIST, IVF_NPROBE, COARSE_P,
 //                IVFPQ_M, IVFPQ_K, FLAT_PTHREAD_THREADS.
+//   29  IVF_PQ_SIMD_OMP      ivfpq_batch_search_omp()
+//        Same query-split strategy via OpenMP schedule(static).
+//        Persistent thread pool avoids per-call pthread_create overhead.
 #define IVF_SIMD                      22
 #define IVF_SIMD_CLUSTER_PTHREAD      23
 #define IVF_SIMD_CLUSTER_OMP          24
@@ -121,6 +124,7 @@
 #define IVF_PQ_SIMD                   26
 #define PQ_IVF_SIMD                   27
 #define IVF_PQ_SIMD_PTHREAD           28
+#define IVF_PQ_SIMD_OMP               29
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -275,6 +279,7 @@ int main(int argc, char *argv[])
         "ivfpq_search_simd (IVF-first: residual PQ, nprobe LUTs per query)",                // 26
         "pqivf_search_simd (PQ-first: global PQ, single LUT per query)",                    // 27
         "ivfpq_batch_search_pthread (IVF-PQ query-parallel, static Pthread partition)",     // 28
+        "ivfpq_batch_search_omp    (IVF-PQ query-parallel, OpenMP schedule(static))",       // 29
     };
     static const char* build_names[] = {
         "",
@@ -298,7 +303,8 @@ int main(int argc, char *argv[])
  || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD \
  || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP     \
  || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD_DYN \
- || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
+ || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD \
+ || SEARCH_ALG == IVF_PQ_SIMD_OMP
     std::cerr << "[config] threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
@@ -313,7 +319,7 @@ int main(int argc, char *argv[])
     std::cerr << "[config] ivf_flatten=" << IVF_FLATTEN << "\n";
 #endif
 #if SEARCH_ALG == IVF_PQ_SIMD || SEARCH_ALG == PQ_IVF_SIMD \
- || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
+ || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD || SEARCH_ALG == IVF_PQ_SIMD_OMP
     std::cerr << "[config] ivf_nlist=" << IVF_NLIST
               << "  ivf_nprobe=" << IVF_NPROBE
               << "  M=" << IVFPQ_M << "  K=" << IVFPQ_K << "\n";
@@ -401,7 +407,7 @@ int main(int argc, char *argv[])
 #endif
 
 #if SEARCH_ALG == IVF_PQ_SIMD || SEARCH_ALG == PQ_IVF_SIMD \
- || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
+ || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD || SEARCH_ALG == IVF_PQ_SIMD_OMP
     IVFPQIndex ivfpq_index;
     {
         const char* variant = (SEARCH_ALG == PQ_IVF_SIMD) ? "pqivf" : "ivfpq";
@@ -414,7 +420,8 @@ int main(int argc, char *argv[])
             std::cerr << "[build] IVFPQIndex loaded from cache " << ivfpq_cache
                       << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
         } else {
-#if SEARCH_ALG == IVF_PQ_SIMD || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
+#if SEARCH_ALG == IVF_PQ_SIMD || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD \
+ || SEARCH_ALG == IVF_PQ_SIMD_OMP
             ivfpq_build(ivfpq_index, base, base_number, vecdim,
                         IVF_NLIST, IVFPQ_M, IVFPQ_K, 25);
 #else
@@ -611,23 +618,35 @@ int main(int argc, char *argv[])
 
     // ── IVF-PQ query-parallel: run all queries in one batch before the loop ──
     // Warm-up + measured run. Per-query latency = total_time / num_queries.
-#if SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
+#if SEARCH_ALG == IVF_PQ_SIMD_PTHREAD || SEARCH_ALG == IVF_PQ_SIMD_OMP
     using _IVFPQResType = std::priority_queue<std::pair<float, uint32_t>>;
     std::vector<_IVFPQResType> ivfpq_batch(test_number);
     // warm-up run (fills caches, avoids cold-start bias)
     {
+#if SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
         ivfpq_batch_search_pthread(ivfpq_index, base, test_query, (int)test_number,
                                    vecdim, k, IVF_NPROBE, p,
                                    ivfpq_batch.data(), FLAT_PTHREAD_THREADS);
+#else
+        ivfpq_batch_search_omp(ivfpq_index, base, test_query, (int)test_number,
+                               vecdim, k, IVF_NPROBE, p,
+                               ivfpq_batch.data(), FLAT_PTHREAD_THREADS);
+#endif
     }
     // measured run
     int64_t ivfpq_batch_avg_us = 0;
     {
         struct timeval tq0, tq1;
         gettimeofday(&tq0, NULL);
+#if SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
         ivfpq_batch_search_pthread(ivfpq_index, base, test_query, (int)test_number,
                                    vecdim, k, IVF_NPROBE, p,
                                    ivfpq_batch.data(), FLAT_PTHREAD_THREADS);
+#else
+        ivfpq_batch_search_omp(ivfpq_index, base, test_query, (int)test_number,
+                               vecdim, k, IVF_NPROBE, p,
+                               ivfpq_batch.data(), FLAT_PTHREAD_THREADS);
+#endif
         gettimeofday(&tq1, NULL);
         int64_t total_us   = tv_diff_us(tq0, tq1);
         ivfpq_batch_avg_us = total_us / (int64_t)test_number;
@@ -732,11 +751,11 @@ int main(int argc, char *argv[])
 #elif SEARCH_ALG == PQ_IVF_SIMD
         auto res = pqivf_search_simd(ivfpq_index, base,
                                      test_query + i*vecdim, k, IVF_NPROBE, p);
-#elif SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
+#elif SEARCH_ALG == IVF_PQ_SIMD_PTHREAD || SEARCH_ALG == IVF_PQ_SIMD_OMP
         // Results computed in parallel batch above; move out for recall eval.
         auto res = std::move(ivfpq_batch[i]);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–28)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–29)."
 #endif
 
         gettimeofday(&newVal, NULL);
@@ -749,7 +768,7 @@ int main(int argc, char *argv[])
 #if SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD || SEARCH_ALG == PQ_SCAN_QUERY_OMP
         diff = pq_scan_batch_avg_us;
 #endif
-#if SEARCH_ALG == IVF_PQ_SIMD_PTHREAD
+#if SEARCH_ALG == IVF_PQ_SIMD_PTHREAD || SEARCH_ALG == IVF_PQ_SIMD_OMP
         diff = ivfpq_batch_avg_us;
 #endif
 
