@@ -126,6 +126,15 @@
 //        HNSW_M              : bidirectional links per node (default 16)
 //        HNSW_EF_CONSTRUCTION: beam width during build (default 200)
 //        HNSW_EF_SEARCH      : beam width during query (latency-recall knob)
+//   ── HNSW multi-entry-point parallel ──────────────────────────────────────
+//   31  HNSW_MULTI_ENTRY_PTHREAD  hnsw_search_multi_entry_pthread()
+//        T Pthreads each search from a different entry point; merge top-k.
+//        Thread 0: enterpoint_node_; Thread t: t*(N/T) (uniform spread).
+//        Improves recall vs. single-thread at same ef_search and wall latency.
+//   32  HNSW_MULTI_ENTRY_OMP      hnsw_search_multi_entry_omp()
+//        Same strategy via OpenMP parallel for schedule(static,1).
+//        Persistent thread pool → lower overhead than Pthread at high T.
+//        Both use HNSW_M, HNSW_EF_CONSTRUCTION, HNSW_EF_SEARCH, FLAT_PTHREAD_THREADS.
 #define IVF_SIMD                      22
 #define IVF_SIMD_CLUSTER_PTHREAD      23
 #define IVF_SIMD_CLUSTER_OMP          24
@@ -135,6 +144,8 @@
 #define IVF_PQ_SIMD_PTHREAD           28
 #define IVF_PQ_SIMD_OMP               29
 #define HNSW_SIMD                     30
+#define HNSW_MULTI_ENTRY_PTHREAD      31
+#define HNSW_MULTI_ENTRY_OMP          32
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -201,6 +212,7 @@
 #include "ARM/Alg_parallel/ivf_pq_simd.h"
 #include "ARM/Alg_parallel/ivf_pq_simd_parallel.h"
 #include "ARM/Alg_parallel/hnsw_simd.h"
+#include "ARM/Alg_parallel/hnsw_simd_parallel.h"
 
 using namespace hnswlib;
 
@@ -300,6 +312,8 @@ int main(int argc, char *argv[])
         "ivfpq_batch_search_pthread (IVF-PQ query-parallel, static Pthread partition)",     // 28
         "ivfpq_batch_search_omp    (IVF-PQ query-parallel, OpenMP schedule(static))",       // 29
         "hnsw_search_simd (HNSW layer-0 beam search, NEON IP distance)",                    // 30
+        "hnsw_search_multi_entry_pthread (HNSW multi-entry parallel, Pthread)",            // 31
+        "hnsw_search_multi_entry_omp     (HNSW multi-entry parallel, OpenMP)",             // 32
     };
     static const char* build_names[] = {
         "",
@@ -324,7 +338,9 @@ int main(int argc, char *argv[])
  || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP     \
  || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD_DYN \
  || SEARCH_ALG == IVF_PQ_SIMD_PTHREAD \
- || SEARCH_ALG == IVF_PQ_SIMD_OMP
+ || SEARCH_ALG == IVF_PQ_SIMD_OMP     \
+ || SEARCH_ALG == HNSW_MULTI_ENTRY_PTHREAD \
+ || SEARCH_ALG == HNSW_MULTI_ENTRY_OMP
     std::cerr << "[config] threads = " << FLAT_PTHREAD_THREADS << "\n";
 #endif
     std::cerr << "[config] p=" << p << "  k=10\n";
@@ -344,7 +360,9 @@ int main(int argc, char *argv[])
               << "  ivf_nprobe=" << IVF_NPROBE
               << "  M=" << IVFPQ_M << "  K=" << IVFPQ_K << "\n";
 #endif
-#if SEARCH_ALG == HNSW_SIMD
+#if SEARCH_ALG == HNSW_SIMD \
+ || SEARCH_ALG == HNSW_MULTI_ENTRY_PTHREAD \
+ || SEARCH_ALG == HNSW_MULTI_ENTRY_OMP
     std::cerr << "[config] hnsw_M=" << HNSW_M
               << "  ef_construction=" << HNSW_EF_CONSTRUCTION
               << "  ef_search=" << HNSW_EF_SEARCH << "\n";
@@ -466,7 +484,9 @@ int main(int argc, char *argv[])
     }
 #endif
 
-#if SEARCH_ALG == HNSW_SIMD
+#if SEARCH_ALG == HNSW_SIMD \
+ || SEARCH_ALG == HNSW_MULTI_ENTRY_PTHREAD \
+ || SEARCH_ALG == HNSW_MULTI_ENTRY_OMP
     InnerProductSpaceNEON hnsw_space(vecdim);
     HierarchicalNSW<float>* hnsw_index = nullptr;
     {
@@ -812,8 +832,16 @@ int main(int argc, char *argv[])
         auto res = std::move(ivfpq_batch[i]);
 #elif SEARCH_ALG == HNSW_SIMD
         auto res = hnsw_search_simd(hnsw_index, test_query + i*vecdim, k, HNSW_EF_SEARCH);
+#elif SEARCH_ALG == HNSW_MULTI_ENTRY_PTHREAD
+        auto res = hnsw_search_multi_entry_pthread(
+            hnsw_index, test_query + i*vecdim, k, HNSW_EF_SEARCH,
+            base_number, FLAT_PTHREAD_THREADS);
+#elif SEARCH_ALG == HNSW_MULTI_ENTRY_OMP
+        auto res = hnsw_search_multi_entry_omp(
+            hnsw_index, test_query + i*vecdim, k, HNSW_EF_SEARCH,
+            base_number, FLAT_PTHREAD_THREADS);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–30)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–32)."
 #endif
 
         gettimeofday(&newVal, NULL);
