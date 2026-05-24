@@ -102,10 +102,18 @@
 //        IVF_FLATTEN 1 = flatten vector list, split evenly (default, balanced)
 //   25  IVF_SIMD_CLUSTER_PTHREAD_DYN  ivf_search_simd_cluster_pthread_dynamic()
 //        cluster-level dynamic scheduling via atomic counter (no IVF_FLATTEN)
+//   ── IVF + PQ hybrid ──────────────────────────────────────────────────────
+//   26  IVF_PQ_SIMD  ivfpq_search_simd()   IVF-first: PQ on residuals, nprobe LUTs/query
+//   27  PQ_IVF_SIMD  pqivf_search_simd()   PQ-first:  global PQ, single LUT/query
+//        IVFPQ_M : PQ subspaces (default 8; must divide vecdim)
+//        IVFPQ_K : PQ centroids per subspace (default 256; max 256 for uint8)
+//        Uses IVF_NLIST, IVF_NPROBE, COARSE_P — no IVF_REORDER or IVF_FLATTEN
 #define IVF_SIMD                      22
 #define IVF_SIMD_CLUSTER_PTHREAD      23
 #define IVF_SIMD_CLUSTER_OMP          24
 #define IVF_SIMD_CLUSTER_PTHREAD_DYN  25
+#define IVF_PQ_SIMD                   26
+#define PQ_IVF_SIMD                   27
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -115,16 +123,21 @@
 #define BUILD_PQ     PQ_BUILD_SIMD
 #define COARSE_P     200
 // Number of Pthread worker threads (used by SEARCH_ALG 14 and 15).
-// IVF parameters (used by SEARCH_ALG 22–23):
+// IVF parameters (used by SEARCH_ALG 22–25):
 //   IVF_NLIST   : number of clusters (64–4096; sqrt(100K) ≈ 316, use 256 or 512)
 //   IVF_NPROBE  : clusters scanned per query (latency-recall knob; sweep 1–nlist)
 //   IVF_REORDER : 0 = original layout (random access), 1 = cluster-contiguous layout
 //   IVF_FLATTEN : (SEARCH_ALG 23–24 only) 0 = cluster-split, 1 = flatten-then-split
 //                 (SEARCH_ALG 25 always uses dynamic cluster-level scheduling)
+// IVF-PQ parameters (used by SEARCH_ALG 26–27):
+//   IVFPQ_M     : PQ subspaces (default 8)
+//   IVFPQ_K     : PQ centroids per subspace (default 256)
 #define IVF_NLIST    1024
 #define IVF_NPROBE   16
 #define IVF_REORDER  0
 #define IVF_FLATTEN  1
+#define IVFPQ_M      8
+#define IVFPQ_K      256
 // Server has 8 cores; 7 workers + 1 main thread = full utilisation.
 #define FLAT_PTHREAD_THREADS   7
 // ─────────────────────────────────────────────────────────────────────────────
@@ -156,6 +169,7 @@
 #include "ARM/Alg_parallel/pq_flat_simd_scan_parallel.h"
 #include "ARM/Alg_parallel/ivf_flat_simd.h"
 #include "ARM/Alg_parallel/ivf_flat_simd_parallel.h"
+#include "ARM/Alg_parallel/ivf_pq_simd.h"
 
 using namespace hnswlib;
 
@@ -250,6 +264,8 @@ int main(int argc, char *argv[])
         "ivf_search_simd_cluster_pthread (IVF cluster-partition parallel, Pthread)", // 23
         "ivf_search_simd_cluster_omp    (IVF cluster-partition parallel, OMP)",    // 24
         "ivf_search_simd_cluster_pthread_dynamic (IVF dynamic cluster scheduling, Pthread)", // 25
+        "ivfpq_search_simd (IVF-first: residual PQ, nprobe LUTs per query)",                // 26
+        "pqivf_search_simd (PQ-first: global PQ, single LUT per query)",                    // 27
     };
     static const char* build_names[] = {
         "",
@@ -285,6 +301,11 @@ int main(int argc, char *argv[])
 #endif
 #if SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD || SEARCH_ALG == IVF_SIMD_CLUSTER_OMP
     std::cerr << "[config] ivf_flatten=" << IVF_FLATTEN << "\n";
+#endif
+#if SEARCH_ALG == IVF_PQ_SIMD || SEARCH_ALG == PQ_IVF_SIMD
+    std::cerr << "[config] ivf_nlist=" << IVF_NLIST
+              << "  ivf_nprobe=" << IVF_NPROBE
+              << "  M=" << IVFPQ_M << "  K=" << IVFPQ_K << "\n";
 #endif
     std::cerr << "========================================\n";
 
@@ -364,6 +385,39 @@ int main(int argc, char *argv[])
                 std::cerr << "[build] IVFIndex saved to " << ivf_cache << "\n";
             else
                 std::cerr << "[build] WARNING: failed to save IVFIndex to " << ivf_cache << "\n";
+        }
+    }
+#endif
+
+#if SEARCH_ALG == IVF_PQ_SIMD || SEARCH_ALG == PQ_IVF_SIMD
+    IVFPQIndex ivfpq_index;
+    {
+        const char* variant = (SEARCH_ALG == IVF_PQ_SIMD) ? "ivfpq" : "pqivf";
+        char ivfpq_cache[256];
+        snprintf(ivfpq_cache, sizeof(ivfpq_cache),
+                 "files/%s_nlist%d_M%d_K%d.bin", variant, IVF_NLIST, IVFPQ_M, IVFPQ_K);
+        gettimeofday(&tb0, NULL);
+        if (ivfpq_load(ivfpq_index, ivfpq_cache)) {
+            gettimeofday(&tb1, NULL);
+            std::cerr << "[build] IVFPQIndex loaded from cache " << ivfpq_cache
+                      << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+        } else {
+#if SEARCH_ALG == IVF_PQ_SIMD
+            ivfpq_build(ivfpq_index, base, base_number, vecdim,
+                        IVF_NLIST, IVFPQ_M, IVFPQ_K, 25);
+#else
+            pqivf_build(ivfpq_index, base, base_number, vecdim,
+                        IVF_NLIST, IVFPQ_M, IVFPQ_K, 25);
+#endif
+            gettimeofday(&tb1, NULL);
+            std::cerr << "[build] IVFPQIndex (" << variant << ") built"
+                      << " nlist=" << IVF_NLIST
+                      << " M=" << IVFPQ_M << " K=" << IVFPQ_K
+                      << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+            if (ivfpq_save(ivfpq_index, ivfpq_cache))
+                std::cerr << "[build] IVFPQIndex saved to " << ivfpq_cache << "\n";
+            else
+                std::cerr << "[build] WARNING: failed to save IVFPQIndex\n";
         }
     }
 #endif
@@ -631,8 +685,14 @@ int main(int argc, char *argv[])
                                    FLAT_PTHREAD_THREADS,
                                    &ivf_t_coarse, &ivf_t_scan, &ivf_t_merge,
                                    &ivf_t_create, &ivf_t_join);
+#elif SEARCH_ALG == IVF_PQ_SIMD
+        auto res = ivfpq_search_simd(ivfpq_index, base,
+                                     test_query + i*vecdim, k, IVF_NPROBE, p);
+#elif SEARCH_ALG == PQ_IVF_SIMD
+        auto res = pqivf_search_simd(ivfpq_index, base,
+                                     test_query + i*vecdim, k, IVF_NPROBE, p);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–25)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–27)."
 #endif
 
         gettimeofday(&newVal, NULL);
