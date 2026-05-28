@@ -15,8 +15,24 @@ echo "[compile] done."
 > test.o
 > test.e
 
-echo "[submit] qsub qsub_mpi.sh"
-qsub -W block=true qsub_mpi.sh
+JOB_ID=$(qsub qsub_mpi.sh)
+if [ $? -ne 0 ]; then
+    echo "[error] qsub failed: $JOB_ID"
+    exit 1
+fi
+echo "[submit] job $JOB_ID"
+
+# Poll qstat every 2 seconds until job status is C (completed) or disappears
+while true; do
+    STATUS=$(qstat "$JOB_ID" 2>/dev/null | tail -1 | awk '{print $5}')
+    if [ "$STATUS" = "C" ] || [ -z "$STATUS" ]; then
+        break
+    fi
+    echo "[wait]   status=$STATUS ..."
+    sleep 2
+done
+
+echo "[done]   job $JOB_ID completed."
 echo ""
 echo "======== stderr (test.e) ========"
 cat test.e

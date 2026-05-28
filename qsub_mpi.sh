@@ -25,19 +25,32 @@
 #PBS -o test.o
 #PBS -l nodes=1:ppn=8
 
-# ── Distribute binary and index cache to every allocated node ─────────────────
-# MPI launches one process per core; every node must have the binary locally.
-# /anndata/ is shared NFS so base/query data does not need copying.
-NODES=$(cat $PBS_NODEFILE | sort | uniq)
+# ── Derive actual resource counts from PBS ────────────────────────────────────
+# NP   = total cores allocated = lines in nodefile = nodes × ppn
+# NNODES = distinct nodes
+NP=$(cat $PBS_NODEFILE | wc -l)
+NNODES=$(cat $PBS_NODEFILE | sort | uniq | wc -l)
+PPN=$(( NP / NNODES ))
+NODES_LIST=$(cat $PBS_NODEFILE | sort | uniq)
 
-for node in $NODES; do
+echo "======== PBS resource info ========" 1>&2
+echo "  nodes   = $NNODES" 1>&2
+echo "  ppn     = $PPN" 1>&2
+echo "  np (NP) = $NP   (mpiexec will launch $NP processes)" 1>&2
+echo "  threads = 1     (no intra-process OMP/Pthread)" 1>&2
+echo "  nodefile entries:" 1>&2
+cat $PBS_NODEFILE 1>&2
+echo "===================================" 1>&2
+
+# ── Distribute binary and index cache to every allocated node ─────────────────
+for node in $NODES_LIST; do
     scp master_ubss1:/home/${USER}/ann/main_mpi ${node}:/home/${USER}/ 1>&2
     scp -r master_ubss1:/home/${USER}/ann/files  ${node}:/home/${USER}/ 1>&2
 done
 
 # ── Run MPI job ───────────────────────────────────────────────────────────────
-# -np must match the np value you intend (change together with nodes/ppn above)
-/usr/local/bin/mpiexec -np 8 -machinefile $PBS_NODEFILE /home/${USER}/main_mpi
+# -np derived from nodefile: always equals nodes × ppn (no oversubscription)
+/usr/local/bin/mpiexec -np $NP -machinefile $PBS_NODEFILE /home/${USER}/main_mpi
 
 # ── Sync newly written index cache files back to master ───────────────────────
 scp -r /home/${USER}/files/ master_ubss1:/home/${USER}/ann/ 2>&1
