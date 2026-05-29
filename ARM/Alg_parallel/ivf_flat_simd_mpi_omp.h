@@ -206,3 +206,162 @@ ivf_omp_search_query_timed(
     }
     return result;
 }
+
+
+// =============================================================================
+// ivf_omp_search_query_reorder — Plan II fine scan using idx.reordered_base
+//
+// Identical contract to ivf_omp_search_query but the inner loop reads
+// reordered_base[j*d] (sequential, stride-d) instead of base[orig*d]
+// (random scatter across 38 MB).  The HW prefetcher can issue cache-line
+// fetches ahead of the SIMD computation, turning DRAM-random into DRAM-stream.
+//
+// PRECONDITION: idx.reordered == true  (IVF_REORDER=1 at build time)
+// `base` is accepted for interface uniformity but is NOT accessed.
+// =============================================================================
+std::priority_queue<std::pair<float, uint32_t>>
+ivf_omp_search_query_reorder(
+    const IVFIndex& idx,
+    const float*    /*base*/,
+    const float*    query,
+    size_t k, size_t nprobe,
+    int nthreads)
+{
+    const size_t d  = idx.vecdim;
+    const size_t np = std::min(nprobe, idx.nlist);
+
+    // ── Coarse (unchanged) ────────────────────────────────────────────────────
+    std::vector<uint32_t> probe_ids(np);
+    {
+        std::vector<std::pair<float, uint32_t>> coarse(idx.nlist);
+        for (size_t c = 0; c < idx.nlist; ++c) {
+            float ip = simd_inner_product_neon_unroll(
+                idx.centroids.data() + c * d, query, d);
+            coarse[c] = {1.0f - ip, static_cast<uint32_t>(c)};
+        }
+        std::partial_sort(coarse.begin(), coarse.begin() + np, coarse.end());
+        for (size_t i = 0; i < np; ++i)
+            probe_ids[i] = coarse[i].second;
+    }
+
+    // ── Fine scan — contiguous reads from reordered_base ─────────────────────
+    std::vector<std::priority_queue<std::pair<float, uint32_t>>> thread_heaps(nthreads);
+    const float* rb = idx.reordered_base.data();
+
+    #pragma omp parallel num_threads(nthreads)
+    {
+        int tid = omp_get_thread_num();
+        auto& heap = thread_heaps[tid];
+
+        #pragma omp for schedule(dynamic, 1)
+        for (int probe = 0; probe < static_cast<int>(np); ++probe) {
+            const uint32_t c     = probe_ids[probe];
+            const size_t   start = idx.cluster_offset[c];
+            const size_t   end   = idx.cluster_offset[c + 1];
+            for (size_t j = start; j < end; ++j) {
+                float    ip   = simd_inner_product_neon_unroll(rb + j * d, query, d);
+                float    dis  = 1.0f - ip;
+                uint32_t orig = idx.invlists[c][j - start];
+                if (heap.size() < k)
+                    heap.push({dis, orig});
+                else if (dis < heap.top().first) {
+                    heap.pop();
+                    heap.push({dis, orig});
+                }
+            }
+        }
+    }
+
+    // ── Merge ─────────────────────────────────────────────────────────────────
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (auto& h : thread_heaps) {
+        while (!h.empty()) {
+            auto top = h.top(); h.pop();
+            if (result.size() < k)
+                result.push(top);
+            else if (top.first < result.top().first) {
+                result.pop();
+                result.push(top);
+            }
+        }
+    }
+    return result;
+}
+
+
+// =============================================================================
+// ivf_omp_search_query_timed_reorder — timed version of the above
+// =============================================================================
+std::priority_queue<std::pair<float, uint32_t>>
+ivf_omp_search_query_timed_reorder(
+    const IVFIndex& idx,
+    const float*    /*base*/,
+    const float*    query,
+    size_t k, size_t nprobe,
+    int nthreads,
+    HybridTimings* tm)
+{
+    const size_t d  = idx.vecdim;
+    const size_t np = std::min(nprobe, idx.nlist);
+
+    // ── Coarse ────────────────────────────────────────────────────────────────
+    std::vector<uint32_t> probe_ids(np);
+    double t0 = omp_get_wtime();
+    {
+        std::vector<std::pair<float, uint32_t>> coarse(idx.nlist);
+        for (size_t c = 0; c < idx.nlist; ++c) {
+            float ip = simd_inner_product_neon_unroll(
+                idx.centroids.data() + c * d, query, d);
+            coarse[c] = {1.0f - ip, static_cast<uint32_t>(c)};
+        }
+        std::partial_sort(coarse.begin(), coarse.begin() + np, coarse.end());
+        for (size_t i = 0; i < np; ++i)
+            probe_ids[i] = coarse[i].second;
+    }
+    tm->t_coarse_s += omp_get_wtime() - t0;
+
+    // ── Fine scan (reordered) ─────────────────────────────────────────────────
+    std::vector<std::priority_queue<std::pair<float, uint32_t>>> thread_heaps(nthreads);
+    const float* rb = idx.reordered_base.data();
+    t0 = omp_get_wtime();
+
+    #pragma omp parallel num_threads(nthreads)
+    {
+        int tid = omp_get_thread_num();
+        auto& heap = thread_heaps[tid];
+
+        #pragma omp for schedule(dynamic, 1)
+        for (int probe = 0; probe < static_cast<int>(np); ++probe) {
+            const uint32_t c     = probe_ids[probe];
+            const size_t   start = idx.cluster_offset[c];
+            const size_t   end   = idx.cluster_offset[c + 1];
+            for (size_t j = start; j < end; ++j) {
+                float    ip   = simd_inner_product_neon_unroll(rb + j * d, query, d);
+                float    dis  = 1.0f - ip;
+                uint32_t orig = idx.invlists[c][j - start];
+                if (heap.size() < k)
+                    heap.push({dis, orig});
+                else if (dis < heap.top().first) {
+                    heap.pop();
+                    heap.push({dis, orig});
+                }
+            }
+        }
+    }
+    tm->t_fine_s += omp_get_wtime() - t0;
+
+    // ── Merge ─────────────────────────────────────────────────────────────────
+    std::priority_queue<std::pair<float, uint32_t>> result;
+    for (auto& h : thread_heaps) {
+        while (!h.empty()) {
+            auto top = h.top(); h.pop();
+            if (result.size() < k)
+                result.push(top);
+            else if (top.first < result.top().first) {
+                result.pop();
+                result.push(top);
+            }
+        }
+    }
+    return result;
+}
