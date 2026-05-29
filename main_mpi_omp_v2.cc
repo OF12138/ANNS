@@ -225,16 +225,20 @@ int main(int argc, char* argv[])
                   << (fine_max - fine_min) / N * us << " us"
                   << "  (" << 100.0 * (fine_max - fine_min) / fine_max << "%)\n";
 
+        const double throughput_qs = static_cast<double>(test_number) / batch_max;
+        const double amortized_us = 1000000.0 / throughput_qs;
+
         std::cerr << "\n[throughput]\n";
-        std::cerr << "  batch wall time : " << batch_max * 1000.0 << " ms\n";
-        std::cerr << "  throughput      : "
-                  << static_cast<double>(test_number) / batch_max << " queries/sec\n";
+        std::cerr << "  batch wall time    : " << batch_max * 1000.0 << " ms\n";
+        std::cerr << "  throughput         : " << throughput_qs << " queries/sec\n";
+        std::cerr << "  amortized latency  : " << amortized_us << " us/query"
+                  << "  (= batch_time / N)\n";
 
         std::cout << std::fixed << std::setprecision(5);
-        std::cout << "average recall: "       << avg_recall  << "\n";
-        std::cout << "average latency (us): " << avg_lat_us  << "\n";
-        std::cout << "throughput (q/s): "
-                  << static_cast<double>(test_number) / batch_max << "\n";
+        std::cout << "average recall: "          << avg_recall    << "\n";
+        std::cout << "average latency (us): "    << avg_lat_us    << "\n";
+        std::cout << "amortized latency (us): "  << amortized_us  << "\n";
+        std::cout << "throughput (q/s): " << throughput_qs << "\n";
     }
 
     delete[] test_query;
