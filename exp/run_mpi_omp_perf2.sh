@@ -17,6 +17,8 @@ echo "[compile] done → ./ivf_mpi_omp_perf2"
 
 cp ivf_mpi_omp_perf2 ~/ann/ivf_mpi_omp_perf2
 
+perl -i -pe 's/[^\x00-\x7F]//g' exp/qsub_mpi_omp_perf2.sh
+
 > test_perf2.o
 > test_perf2.e
 

@@ -7,6 +7,8 @@ mpicxx main_mpi_omp_v2.cc -o main_mpi_omp_v2 -O2 -std=c++11 -fopenmp -lm
 if [ $? -ne 0 ]; then echo "[error] compilation failed."; exit 1; fi
 echo "[compile] done."
 
+perl -i -pe 's/[^\x00-\x7F]//g' qsub_mpi_omp_v2.sh
+
 > test_v2.o
 > test_v2.e
 
