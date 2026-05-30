@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <omp.h>
 #include <queue>
+#include <set>
 #include <vector>
 #include <utility>
 #include <cstdint>
@@ -111,6 +112,64 @@ _hnsw_merge_results(
         }
     }
     return merged;
+}
+
+
+// =============================================================================
+// _hnsw_merge_results_dedup — same as _hnsw_merge_results but skips duplicate
+// external IDs.  Required when T threads explore the same small graph and
+// converge to overlapping candidate sets: without dedup, a duplicate ID can
+// displace a unique good result in the merged heap, shrinking effective k.
+// =============================================================================
+static std::priority_queue<std::pair<float, uint32_t>>
+_hnsw_merge_results_dedup(
+    std::vector<std::priority_queue<std::pair<float, uint32_t>>>& results,
+    int T, size_t k)
+{
+    std::priority_queue<std::pair<float, uint32_t>> merged;
+    std::set<uint32_t> seen;
+    for (int t = 0; t < T; ++t) {
+        while (!results[t].empty()) {
+            auto item = results[t].top();
+            results[t].pop();
+            if (!seen.insert(item.second).second) continue;
+            if (merged.size() < k) {
+                merged.push(item);
+            } else if (item.first < merged.top().first) {
+                merged.pop();
+                merged.push(item);
+            }
+        }
+    }
+    return merged;
+}
+
+
+// =============================================================================
+// hnsw_search_multi_entry_omp_v2 — multi-entry OMP search with dedup merge
+//
+// Identical to hnsw_search_multi_entry_omp except the T result heaps are
+// merged with _hnsw_merge_results_dedup, guaranteeing k unique IDs in the
+// output even when threads' candidate sets overlap (common on small graphs).
+// =============================================================================
+std::priority_queue<std::pair<float, uint32_t>>
+hnsw_search_multi_entry_omp_v2(
+    HierarchicalNSW<float>* appr_alg,
+    const float* query, size_t k, size_t ef,
+    size_t base_number, int num_threads)
+{
+    const int T = num_threads;
+    std::vector<std::priority_queue<std::pair<float, uint32_t>>> results(T);
+
+    #pragma omp parallel for num_threads(T) schedule(static, 1)
+    for (int t = 0; t < T; ++t) {
+        tableint ep = (t == 0)
+            ? appr_alg->enterpoint_node_
+            : static_cast<tableint>((size_t)t * base_number / T);
+        results[t] = _hnsw_search_from_ep(appr_alg, query, k, ef, ep);
+    }
+
+    return _hnsw_merge_results_dedup(results, T, k);
 }
 
 
