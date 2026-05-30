@@ -79,21 +79,14 @@ int main(int argc, char* argv[])
 
     // ── Load data ─────────────────────────────────────────────────────────────
     const std::string data_path = "/anndata/";
-    size_t test_number = 0, base_number = 0, test_gt_d = 0, vecdim = 0;
+    size_t test_number = 0, test_gt_d = 0, vecdim = 0;
 
     float* test_query = LoadData<float>(data_path + "DEEP100K.query.fbin",
                                         test_number, vecdim);
     int*   test_gt    = LoadData<int>  (data_path + "DEEP100K.gt.query.100k.top100.bin",
                                         test_number, test_gt_d);
-    float* base       = LoadData<float>(data_path + "DEEP100K.base.100k.fbin",
-                                        base_number, vecdim);
     test_number = 2000;
     const size_t k = 10;
-
-    if (rank == 0)
-        std::cerr << "[data] base=" << base_number
-                  << "  queries=" << test_number
-                  << "  dim=" << vecdim << "\n";
 
     // ── Build or load IVF+HNSW ────────────────────────────────────────────────
     IVFHNSWIndex idx;
@@ -108,13 +101,26 @@ int main(int argc, char* argv[])
     bool loaded = ivf_hnsw_load(idx, cache_dir, HNSW_M, HNSW_EF_CONSTRUCTION);
     if (loaded) {
         gettimeofday(&tb1, NULL);
-        if (rank == 0)
+        if (rank == 0) {
+            std::cerr << "[data] queries=" << test_number
+                      << "  dim=" << vecdim << "\n";
             std::cerr << "[build] loaded from cache: "
                       << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+        }
     } else {
-        if (rank == 0) std::cerr << "[build] building IVF+HNSW...\n";
+        // Cache miss: load base only now (avoids holding 38 MB during cache load)
+        size_t base_number = 0, base_vecdim = 0;
+        float* base = LoadData<float>(data_path + "DEEP100K.base.100k.fbin",
+                                      base_number, base_vecdim);
+        if (rank == 0) {
+            std::cerr << "[data] base=" << base_number
+                      << "  queries=" << test_number
+                      << "  dim=" << vecdim << "\n";
+            std::cerr << "[build] building IVF+HNSW...\n";
+        }
         ivf_hnsw_build(idx, base, base_number, vecdim,
                        IVF_NLIST, 25, HNSW_M, HNSW_EF_CONSTRUCTION);
+        delete[] base;
         gettimeofday(&tb1, NULL);
         if (rank == 0) {
             std::cerr << "[build] done: "
@@ -129,9 +135,6 @@ int main(int argc, char* argv[])
             ivf_hnsw_load(idx, cache_dir, HNSW_M, HNSW_EF_CONSTRUCTION);
         }
     }
-    // base is only needed for building; free it now to reclaim ~38 MB per
-    // process before the search loop (critical when NP processes share one node)
-    delete[] base; base = nullptr;
 
     // ── Warm-up ───────────────────────────────────────────────────────────────
     if (rank == 0) std::cerr << "[warmup] running " << test_number << " queries...\n";
