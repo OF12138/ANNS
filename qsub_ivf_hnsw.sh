@@ -13,8 +13,11 @@ echo "===================================" 1>&2
 
 for node in $NODES_LIST; do
     scp master_ubss1:/home/${USER}/ann/main_ivf_hnsw ${node}:/home/${USER}/ 1>&2
+    scp -r master_ubss1:/home/${USER}/ann/files       ${node}:/home/${USER}/ 1>&2
 done
 
 /home/${USER}/main_ivf_hnsw
 
-rm /home/${USER}/main_ivf_hnsw
+scp -r /home/${USER}/files/ master_ubss1:/home/${USER}/ann/ 2>&1
+rm    /home/${USER}/main_ivf_hnsw
+rm -r /home/${USER}/files/
