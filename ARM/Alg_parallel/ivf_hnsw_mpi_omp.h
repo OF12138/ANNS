@@ -21,6 +21,7 @@
 
 #include <mpi.h>
 #include <cfloat>
+#include <set>
 #include <vector>
 #include <queue>
 #include <utility>
@@ -111,10 +112,16 @@ ivf_hnsw_mpi_omp_search_query(
         auto local_res = hnsw_search_multi_entry_omp(
             hnsw, query, k, ef, csz, t_eff);
 
+        // Deduplicate IDs from multi-entry results before merging:
+        // T threads explore the same small graph and often return the same
+        // vector from different entry points.  Without dedup, duplicate IDs
+        // occupy heap slots, leaving fewer than k unique results.
+        std::set<uint32_t> seen;
         while (!local_res.empty()) {
             float    dist = local_res.top().first;
             uint32_t orig = local_res.top().second;
             local_res.pop();
+            if (!seen.insert(orig).second) continue;
             if (local_heap.size() < k) {
                 local_heap.push({dist, orig});
             } else if (dist < local_heap.top().first) {
