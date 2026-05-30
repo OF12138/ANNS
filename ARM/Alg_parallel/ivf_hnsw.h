@@ -25,6 +25,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
+#include <fstream>
+#include <string>
+#include <sys/stat.h>
 
 #include "ivf_flat_simd.h"   // IVFIndex, ivf_build, ivf_load/save
 #include "hnsw_simd.h"       // InnerProductSpaceNEON, HierarchicalNSW, hnsw_search_simd
@@ -170,4 +173,66 @@ void ivf_hnsw_free(IVFHNSWIndex& idx)
     idx.clusters.clear();
     delete idx.space;
     idx.space = nullptr;
+}
+
+
+// =============================================================================
+// ivf_hnsw_save -- persist the full IVF+HNSW index to a directory
+//
+// Layout inside `dir`:
+//   ivf.bin          -- IVF centroids + invlists (via ivf_save)
+//   c0000.hnsw ...   -- one hnswlib binary file per non-empty cluster
+//
+// Returns true on success.
+// =============================================================================
+static bool ivf_hnsw_save(const IVFHNSWIndex& idx, const std::string& dir)
+{
+    mkdir(dir.c_str(), 0755);
+
+    // IVF part
+    std::string ivf_path = dir + "/ivf.bin";
+    if (!ivf_save(idx.ivf, ivf_path.c_str())) return false;
+
+    // Per-cluster HNSW files
+    for (size_t c = 0; c < idx.clusters.size(); ++c) {
+        if (!idx.clusters[c]) continue;
+        char name[32];
+        snprintf(name, sizeof(name), "/c%04zu.hnsw", c);
+        idx.clusters[c]->saveIndex(dir + name);
+    }
+    return true;
+}
+
+
+// =============================================================================
+// ivf_hnsw_load -- restore an IVF+HNSW index previously saved with ivf_hnsw_save
+//
+// Returns true if every expected file was found and loaded, false otherwise.
+// =============================================================================
+static bool ivf_hnsw_load(IVFHNSWIndex& idx, const std::string& dir,
+                           size_t M, size_t ef_construction)
+{
+    // IVF part
+    std::string ivf_path = dir + "/ivf.bin";
+    if (!ivf_load(idx.ivf, ivf_path.c_str())) return false;
+
+    idx.M               = M;
+    idx.ef_construction = ef_construction;
+    idx.space           = new InnerProductSpaceNEON(idx.ivf.vecdim);
+
+    size_t nlist = idx.ivf.nlist;
+    idx.clusters.assign(nlist, nullptr);
+
+    for (size_t c = 0; c < nlist; ++c) {
+        if (idx.ivf.invlists[c].empty()) continue;
+        char name[32];
+        snprintf(name, sizeof(name), "/c%04zu.hnsw", c);
+        std::string path = dir + name;
+
+        // Check file exists before constructing
+        { std::ifstream chk(path, std::ios::binary); if (!chk.good()) return false; }
+
+        idx.clusters[c] = new HierarchicalNSW<float>(idx.space, path);
+    }
+    return true;
 }

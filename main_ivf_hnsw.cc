@@ -80,18 +80,33 @@ int main()
     std::cerr << "[data] base=" << base_number << "  queries=" << test_number
               << "  dim=" << vecdim << "\n";
 
-    // ── Build IVF+HNSW ────────────────────────────────────────────────────────
+    // ── Build or load IVF+HNSW ────────────────────────────────────────────────
     IVFHNSWIndex idx;
+
+    char cache_dir[256];
+    snprintf(cache_dir, sizeof(cache_dir),
+             "files/ivf_hnsw_nlist%d_M%d_ef%d",
+             IVF_NLIST, HNSW_M, HNSW_EF_CONSTRUCTION);
 
     struct timeval tb0, tb1;
     gettimeofday(&tb0, NULL);
 
-    std::cerr << "[build] running IVF k-means (nlist=" << IVF_NLIST << ")...\n";
-    ivf_hnsw_build(idx, base, base_number, vecdim,
-                   IVF_NLIST, 25, HNSW_M, HNSW_EF_CONSTRUCTION);
+    bool loaded = ivf_hnsw_load(idx, cache_dir, HNSW_M, HNSW_EF_CONSTRUCTION);
+    if (loaded) {
+        gettimeofday(&tb1, NULL);
+        std::cerr << "[build] index loaded from cache (" << cache_dir << "): "
+                  << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+    } else {
+        std::cerr << "[build] running IVF k-means + HNSW build...\n";
+        ivf_hnsw_build(idx, base, base_number, vecdim,
+                       IVF_NLIST, 25, HNSW_M, HNSW_EF_CONSTRUCTION);
+        gettimeofday(&tb1, NULL);
+        std::cerr << "[build] done: " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 
-    gettimeofday(&tb1, NULL);
-    std::cerr << "[build] done: " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+        std::cerr << "[build] saving index to " << cache_dir << " ...\n";
+        ivf_hnsw_save(idx, cache_dir);
+        std::cerr << "[build] saved.\n";
+    }
 
     // ── Warm-up ───────────────────────────────────────────────────────────────
     std::cerr << "[warmup] running " << test_number << " queries...\n";
