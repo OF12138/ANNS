@@ -168,11 +168,14 @@ int main(int argc, char* argv[])
             for (size_t j = 0; j < k; ++j)
                 gtset.insert(static_cast<uint32_t>(
                     test_gt[j + i * test_gt_d]));
-            size_t acc = 0;
+            std::set<uint32_t> found;
             while (!res.empty()) {
-                if (gtset.count(res.top().second)) ++acc;
+                found.insert(res.top().second);
                 res.pop();
             }
+            size_t acc = 0;
+            for (uint32_t id : found)
+                if (gtset.count(id)) ++acc;
             recalls[i] = static_cast<float>(acc) / k;
         }
     }

@@ -172,11 +172,14 @@ int main()
         for (size_t j = 0; j < k; ++j)
             gtset.insert(static_cast<uint32_t>(
                 test_gt[j + i * test_gt_d]));
-        size_t acc = 0;
+        std::set<uint32_t> found;
         while (!global_heap.empty()) {
-            if (gtset.count(global_heap.top().second)) ++acc;
+            found.insert(global_heap.top().second);
             global_heap.pop();
         }
+        size_t acc = 0;
+        for (uint32_t id : found)
+            if (gtset.count(id)) ++acc;
         total_recall += static_cast<double>(acc) / k;
     }
 
