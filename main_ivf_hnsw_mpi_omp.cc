@@ -129,6 +129,9 @@ int main(int argc, char* argv[])
             ivf_hnsw_load(idx, cache_dir, HNSW_M, HNSW_EF_CONSTRUCTION);
         }
     }
+    // base is only needed for building; free it now to reclaim ~38 MB per
+    // process before the search loop (critical when NP processes share one node)
+    delete[] base; base = nullptr;
 
     // ── Warm-up ───────────────────────────────────────────────────────────────
     if (rank == 0) std::cerr << "[warmup] running " << test_number << " queries...\n";
@@ -242,7 +245,6 @@ int main(int argc, char* argv[])
     ivf_hnsw_free(idx);
     delete[] test_query;
     delete[] test_gt;
-    delete[] base;
     MPI_Finalize();
     return 0;
 }
