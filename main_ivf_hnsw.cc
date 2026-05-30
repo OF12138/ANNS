@@ -151,7 +151,8 @@ int main()
             if (!hnsw) continue;
             auto local_res = hnsw_search_simd(hnsw, q, k, HNSW_EF_SEARCH);
             while (!local_res.empty()) {
-                auto [dist, orig] = local_res.top();
+                float    dist = local_res.top().first;
+                uint32_t orig = local_res.top().second;
                 local_res.pop();
                 if (global_heap.size() < k) {
                     global_heap.push({dist, orig});

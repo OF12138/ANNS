@@ -149,7 +149,8 @@ ivf_hnsw_search(const IVFHNSWIndex& idx,
 
         // Merge local_res into global_heap, keeping only top-k
         while (!local_res.empty()) {
-            auto [dist, orig] = local_res.top();
+            float    dist = local_res.top().first;
+            uint32_t orig = local_res.top().second;
             local_res.pop();
             if (global_heap.size() < k) {
                 global_heap.push({dist, orig});
