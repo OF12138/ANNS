@@ -4,3 +4,5 @@
 *.xlsx
 *.docx
 gen_analysis.py
+
+X86/data/
