@@ -14,7 +14,9 @@
       "Bash(python3 -c \"import docx; import openpyxl; print\\('both available'\\)\")",
       "Bash(python3 -c \"import subprocess; r = subprocess.run\\(['pip', 'install', 'python-docx', 'openpyxl'], capture_output=True, text=True\\); print\\(r.stdout[-500:]\\); print\\(r.stderr[-200:]\\)\")",
       "Bash(python -c \"import docx; import openpyxl; print\\('both available'\\)\")",
-      "Bash(python -m pip install python-docx openpyxl)"
+      "Bash(python -m pip install python-docx openpyxl)",
+      "PowerShell(conda env *)",
+      "PowerShell(conda activate *)"
     ]
   }
 }
