@@ -3,6 +3,11 @@
 *.md
 *.xlsx
 *.docx
+*.csv
+*.exe
+*.bat
+*.txt
+
 gen_analysis.py
 
 X86/data/
