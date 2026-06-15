@@ -1,4 +1,6 @@
 .claude/
+.vscode/
+
 *.pdf
 *.md
 *.xlsx
@@ -13,3 +15,7 @@ gen_analysis.py
 X86/data/
 
 MPI/
+
+report/
+Manual/
+
