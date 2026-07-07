@@ -22,7 +22,12 @@
       "Bash(where soffice *)",
       "Read(//c/Program Files/LibreOffice/program/**)",
       "PowerShell(g++ *)",
-      "PowerShell(wsl -e bash -lc \"which g++ aarch64-linux-gnu-g++ qemu-aarch64 2>/dev/null; g++ --version 2>/dev/null | head -1\")"
+      "PowerShell(wsl -e bash -lc \"which g++ aarch64-linux-gnu-g++ qemu-aarch64 2>/dev/null; g++ --version 2>/dev/null | head -1\")",
+      "PowerShell(python \"C:\\\\Users\\\\19930\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--Code-Parallel-ANNS\\\\832294a0-485c-4cf0-8a21-8ce2f2f4cbda\\\\scratchpad\\\\build_final_xlsx.py\")",
+      "PowerShell(python \"F:\\\\Code\\\\Parallel\\\\ANNS\\\\.claude\\\\skills\\\\xlsx\\\\scripts\\\\recalc.py\" \"F:\\\\Code\\\\Parallel\\\\ANNS\\\\helper\\\\final\\\\final_summary.xlsx\" 60)",
+      "PowerShell(python \"C:\\\\Users\\\\19930\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--Code-Parallel-ANNS\\\\832294a0-485c-4cf0-8a21-8ce2f2f4cbda\\\\scratchpad\\\\verify_final_xlsx.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\19930\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--Code-Parallel-ANNS\\\\832294a0-485c-4cf0-8a21-8ce2f2f4cbda\\\\scratchpad\\\\build_ch2_xlsx.py\")",
+      "PowerShell(python \"C:\\\\Users\\\\19930\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\F--Code-Parallel-ANNS\\\\832294a0-485c-4cf0-8a21-8ce2f2f4cbda\\\\scratchpad\\\\verify_ch2_xlsx.py\")"
     ]
   }
 }
