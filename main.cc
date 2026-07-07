@@ -135,6 +135,18 @@
 //        Same strategy via OpenMP parallel for schedule(static,1).
 //        Persistent thread pool → lower overhead than Pthread at high T.
 //        Both use HNSW_M, HNSW_EF_CONSTRUCTION, HNSW_EF_SEARCH, FLAT_PTHREAD_THREADS.
+//   ── Final-report advanced algorithms (Chapter 3 new content) ─────────────
+//   33  PQ4_SCALAR      pq4_search_rerank()        4-bit PQ (M=16,K=16), scalar ADC scan + rerank
+//   34  PQ4_FASTSCAN    fastscan_search_rerank()   same codes, nibble-packed blocks + vqtbl1q
+//                       register-resident LUT (16 lookups/instruction) + rerank
+//   35  OPQ_GATHER      opq_search_gather()        learned rotation (OPQ-NP, Procrustes+SVD)
+//                       + cc_unroll LUT + gather scan + exact rerank
+//   36  PQ_SDC_SEQ      pq_sdc_batch_sequential()  SDC batch: encode→scan→rerank, 1 thread,
+//                       per-phase timing
+//   37  PQ_SDC_PIPELINE pq_sdc_batch_pipeline()    SDC 3-stage producer-consumer pipeline:
+//                       1 encoder + SDC_SCAN_THREADS scanners + 1 reranker, bounded queues
+//   38  PQ_SDC_OMP      pq_sdc_batch_omp()         SDC flat query-parallel OMP (fair baseline
+//                       for the pipeline: same cores, no stage partitioning)
 #define IVF_SIMD                      22
 #define IVF_SIMD_CLUSTER_PTHREAD      23
 #define IVF_SIMD_CLUSTER_OMP          24
@@ -146,6 +158,12 @@
 #define HNSW_SIMD                     30
 #define HNSW_MULTI_ENTRY_PTHREAD      31
 #define HNSW_MULTI_ENTRY_OMP          32
+#define PQ4_SCALAR                    33
+#define PQ4_FASTSCAN                  34
+#define OPQ_GATHER                    35
+#define PQ_SDC_SEQ                    36
+#define PQ_SDC_PIPELINE               37
+#define PQ_SDC_OMP                    38
 
 #define PQ_BUILD_SCALAR        1
 #define PQ_BUILD_SIMD          2
@@ -180,6 +198,21 @@
 #define HNSW_EF_SEARCH        50
 // Server has 8 cores; 7 workers + 1 main thread = full utilisation.
 #define FLAT_PTHREAD_THREADS   7
+// FastScan / OPQ / SDC-pipeline parameters (SEARCH_ALG 33–38):
+//   FS_M             : FastScan subspaces (K fixed at 16 → 4-bit codes;
+//                      M=16 → 8 B/vector, same code size as PQ M=8 K=256)
+//   OPQ_M, OPQ_K     : PQ shape used under the learned rotation
+//   OPQ_ITERS        : alternating-minimization outer iterations
+//   OPQ_KMEANS_INNER : k-means refinement iterations per outer iteration
+//   SDC_SCAN_THREADS : pipeline scan workers (1 encoder + N scan + 1 rerank ≤ 8 cores)
+//   SDC_CHUNK        : queries per pipeline chunk
+#define FS_M             16
+#define OPQ_M            8
+#define OPQ_K            256
+#define OPQ_ITERS        8
+#define OPQ_KMEANS_INNER 3
+#define SDC_SCAN_THREADS 5
+#define SDC_CHUNK        32
 // ─────────────────────────────────────────────────────────────────────────────
 
 // =============================================================================
@@ -213,6 +246,9 @@
 #include "ARM/Alg_parallel/ivf_pq_simd_parallel.h"
 #include "ARM/Alg_parallel/hnsw_simd.h"
 #include "ARM/Alg_parallel/hnsw_simd_parallel.h"
+#include "ARM/Alg_final/fastscan.h"
+#include "ARM/Alg_final/opq.h"
+#include "ARM/Alg_final/pq_sdc_pipeline.h"
 
 using namespace hnswlib;
 
@@ -314,6 +350,12 @@ int main(int argc, char *argv[])
         "hnsw_search_simd (HNSW layer-0 beam search, NEON IP distance)",                    // 30
         "hnsw_search_multi_entry_pthread (HNSW multi-entry parallel, Pthread)",            // 31
         "hnsw_search_multi_entry_omp     (HNSW multi-entry parallel, OpenMP)",             // 32
+        "pq4_search_rerank (4-bit PQ M=16 K=16, scalar ADC scan + rerank)",                // 33
+        "fastscan_search_rerank (FastScan: packed nibbles + vqtbl1q register LUT)",        // 34
+        "opq_search_gather (OPQ rotation + cc_unroll LUT + gather scan + rerank)",         // 35
+        "pq_sdc_batch_sequential (PQ-SDC batch: encode->scan->rerank, 1 thread)",          // 36
+        "pq_sdc_batch_pipeline (PQ-SDC 3-stage producer-consumer pipeline, pthread)",      // 37
+        "pq_sdc_batch_omp (PQ-SDC flat query-parallel, OpenMP)",                           // 38
     };
     static const char* build_names[] = {
         "",
@@ -326,7 +368,8 @@ int main(int argc, char *argv[])
               << "  " << search_names[SEARCH_ALG] << "\n";
 #if (SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER) \
  || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP \
- || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
+ || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP   \
+ || (SEARCH_ALG >= PQ_SDC_SEQ && SEARCH_ALG <= PQ_SDC_OMP)
     std::cerr << "[config] build_pq   = " << BUILD_PQ
               << "  " << build_names[BUILD_PQ] << "\n";
 #endif
@@ -367,6 +410,20 @@ int main(int argc, char *argv[])
               << "  ef_construction=" << HNSW_EF_CONSTRUCTION
               << "  ef_search=" << HNSW_EF_SEARCH << "\n";
 #endif
+#if SEARCH_ALG == PQ4_SCALAR || SEARCH_ALG == PQ4_FASTSCAN
+    std::cerr << "[config] fastscan M=" << FS_M << "  K=16 (4-bit codes, "
+              << FS_M / 2 << " B/vector)\n";
+#endif
+#if SEARCH_ALG == OPQ_GATHER
+    std::cerr << "[config] opq M=" << OPQ_M << "  K=" << OPQ_K
+              << "  opq_iters=" << OPQ_ITERS
+              << "  kmeans_inner=" << OPQ_KMEANS_INNER << "\n";
+#endif
+#if SEARCH_ALG == PQ_SDC_PIPELINE
+    std::cerr << "[config] sdc chunk=" << SDC_CHUNK
+              << "  scan_threads=" << SDC_SCAN_THREADS
+              << "  (1 encoder + " << SDC_SCAN_THREADS << " scan + 1 rerank)\n";
+#endif
     std::cerr << "========================================\n";
 
     // ── Load dataset ─────────────────────────────────────────────────────────
@@ -398,7 +455,8 @@ int main(int argc, char *argv[])
 
 #if (SEARCH_ALG >= PQ_NORMAL && SEARCH_ALG <= PQ_GATHER) \
  || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP \
- || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
+ || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP   \
+ || (SEARCH_ALG >= PQ_SDC_SEQ && SEARCH_ALG <= PQ_SDC_OMP)
     PQIndex pq_index;
     gettimeofday(&tb0, NULL);
 #if   BUILD_PQ == PQ_BUILD_SCALAR
@@ -413,11 +471,60 @@ int main(int argc, char *argv[])
               << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
 
     // Transposed centroid layout — needed by CC-SIMD variants (11, 12, 13)
+    // and by the SDC query encoder (36–38, reuses the cc_unroll LUT builder)
 #if SEARCH_ALG == PQ_CC_SIMD || SEARCH_ALG == PQ_CC_UNROLL || SEARCH_ALG == PQ_GATHER \
  || SEARCH_ALG == PQ_GATHER_QUERY_PTHREAD || SEARCH_ALG == PQ_GATHER_QUERY_OMP  \
- || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP
+ || SEARCH_ALG == PQ_SCAN_QUERY_PTHREAD   || SEARCH_ALG == PQ_SCAN_QUERY_OMP    \
+ || (SEARCH_ALG >= PQ_SDC_SEQ && SEARCH_ALG <= PQ_SDC_OMP)
     PQIndexSIMD pq_simd(pq_index);
 #endif
+
+    // SDC centroid-to-centroid tables (offline, built from the PQ codebooks)
+#if SEARCH_ALG >= PQ_SDC_SEQ && SEARCH_ALG <= PQ_SDC_OMP
+    PQSDCTables sdc_tabs;
+    gettimeofday(&tb0, NULL);
+    pq_sdc_build_tables(pq_index, sdc_tabs);
+    gettimeofday(&tb1, NULL);
+    std::cerr << "[build] PQSDCTables (M*K*K = "
+              << pq_index.M * pq_index.K * pq_index.K * sizeof(float) / 1024
+              << " KB): " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+#endif
+#endif
+
+#if SEARCH_ALG == PQ4_SCALAR || SEARCH_ALG == PQ4_FASTSCAN
+    FastScanIndex fs_index;
+    gettimeofday(&tb0, NULL);
+    fastscan_build(fs_index, base, base_number, vecdim, FS_M, 25);
+    gettimeofday(&tb1, NULL);
+    std::cerr << "[build] FastScanIndex (M=" << FS_M << " K=16): "
+              << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+#endif
+
+#if SEARCH_ALG == OPQ_GATHER
+    OPQIndex opq_index;
+    {
+        char opq_cache[256];
+        snprintf(opq_cache, sizeof(opq_cache),
+                 "files/opq_M%d_K%d_it%d.bin", OPQ_M, OPQ_K, OPQ_ITERS);
+        gettimeofday(&tb0, NULL);
+        if (opq_load(opq_index, opq_cache)) {
+            gettimeofday(&tb1, NULL);
+            std::cerr << "[build] OPQIndex loaded from cache " << opq_cache
+                      << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+        } else {
+            opq_build(opq_index, base, base_number, vecdim,
+                      OPQ_M, OPQ_K, OPQ_ITERS, OPQ_KMEANS_INNER, 25);
+            gettimeofday(&tb1, NULL);
+            std::cerr << "[build] OPQIndex built  M=" << OPQ_M
+                      << "  K=" << OPQ_K << "  iters=" << OPQ_ITERS
+                      << ": " << tv_diff_us(tb0, tb1) / 1000 << " ms\n";
+            if (opq_save(opq_index, opq_cache))
+                std::cerr << "[build] OPQIndex saved to " << opq_cache << "\n";
+            else
+                std::cerr << "[build] WARNING: failed to save OPQIndex to " << opq_cache << "\n";
+        }
+    }
+    PQIndexSIMD opq_pq_simd(opq_index.pq);
 #endif
 
 #if SEARCH_ALG == IVF_SIMD || SEARCH_ALG == IVF_SIMD_CLUSTER_PTHREAD \
@@ -733,6 +840,100 @@ int main(int argc, char *argv[])
     }
 #endif
 
+    // ── FastScan / PQ4 coarse-phase timing ───────────────────────────────────
+    // Times ONLY the coarse candidate generation (LUT build + code scan) over
+    // all queries, before the main timed loop.  Comparing [phase] avg coarse
+    // between SEARCH_ALG 33 and 34 isolates the vqtbl1q kernel speedup from
+    // the (identical) rerank cost.
+#if SEARCH_ALG == PQ4_SCALAR || SEARCH_ALG == PQ4_FASTSCAN
+    {
+        std::vector<uint32_t> cand_tmp;
+        double sum_coarse = 0.0;
+        for (int i = 0; i < (int)test_number; ++i) {
+            struct timeval ca, cb;
+            gettimeofday(&ca, NULL);
+#if SEARCH_ALG == PQ4_SCALAR
+            pq4_coarse_topp(fs_index, test_query + i*vecdim, p, cand_tmp);
+#else
+            fastscan_coarse_topp(fs_index, test_query + i*vecdim, p, cand_tmp);
+#endif
+            gettimeofday(&cb, NULL);
+            sum_coarse += tv_diff_us(ca, cb);
+        }
+        std::cerr << std::fixed << std::setprecision(2);
+        std::cerr << "[phase] avg coarse scan: " << sum_coarse / test_number
+                  << " us (LUT build + top-" << p << " candidate scan)\n";
+    }
+#endif
+
+    // ── PQ-SDC batch: warm-up + measured run before the loop ─────────────────
+    // Per-query latency below = batch wall time / num_queries (throughput
+    // metric).  SEQ prints the per-phase breakdown; PIPELINE prints per-stage
+    // busy time so stage utilization (busy / wall) exposes the imbalance.
+#if SEARCH_ALG >= PQ_SDC_SEQ && SEARCH_ALG <= PQ_SDC_OMP
+    std::vector<PQSDCResult> sdc_results(test_number);
+    int64_t sdc_batch_avg_us = 0;
+    {
+        double e_us = 0.0, s_us = 0.0, r_us = 0.0;
+        // warm-up run (fills caches, avoids cold-start bias)
+#if SEARCH_ALG == PQ_SDC_SEQ
+        pq_sdc_batch_sequential(pq_index, pq_simd, sdc_tabs, base, test_query,
+                                (int)test_number, vecdim, k, p,
+                                sdc_results.data(), &e_us, &s_us, &r_us);
+#elif SEARCH_ALG == PQ_SDC_PIPELINE
+        pq_sdc_batch_pipeline(pq_index, pq_simd, sdc_tabs, base, test_query,
+                              (int)test_number, vecdim, k, p,
+                              sdc_results.data(), SDC_SCAN_THREADS, SDC_CHUNK,
+                              &e_us, &s_us, &r_us);
+#else
+        pq_sdc_batch_omp(pq_index, pq_simd, sdc_tabs, base, test_query,
+                         (int)test_number, vecdim, k, p,
+                         sdc_results.data(), FLAT_PTHREAD_THREADS);
+#endif
+        // measured run
+        struct timeval ts0, ts1;
+        gettimeofday(&ts0, NULL);
+#if SEARCH_ALG == PQ_SDC_SEQ
+        pq_sdc_batch_sequential(pq_index, pq_simd, sdc_tabs, base, test_query,
+                                (int)test_number, vecdim, k, p,
+                                sdc_results.data(), &e_us, &s_us, &r_us);
+#elif SEARCH_ALG == PQ_SDC_PIPELINE
+        pq_sdc_batch_pipeline(pq_index, pq_simd, sdc_tabs, base, test_query,
+                              (int)test_number, vecdim, k, p,
+                              sdc_results.data(), SDC_SCAN_THREADS, SDC_CHUNK,
+                              &e_us, &s_us, &r_us);
+#else
+        pq_sdc_batch_omp(pq_index, pq_simd, sdc_tabs, base, test_query,
+                         (int)test_number, vecdim, k, p,
+                         sdc_results.data(), FLAT_PTHREAD_THREADS);
+#endif
+        gettimeofday(&ts1, NULL);
+        int64_t total_us = tv_diff_us(ts0, ts1);
+        sdc_batch_avg_us = total_us / (int64_t)test_number;
+        std::cerr << std::fixed << std::setprecision(2);
+        std::cerr << "[sdc batch] total=" << total_us << " us"
+                  << "  avg/query=" << (double)total_us / test_number << " us"
+                  << "  throughput=" << 1e6 * test_number / (double)total_us
+                  << " qps\n";
+#if SEARCH_ALG == PQ_SDC_SEQ
+        std::cerr << "[phase] encode: " << e_us / test_number << " us/query ("
+                  << e_us / total_us * 100.0 << "%)\n";
+        std::cerr << "[phase] scan:   " << s_us / test_number << " us/query ("
+                  << s_us / total_us * 100.0 << "%)\n";
+        std::cerr << "[phase] rerank: " << r_us / test_number << " us/query ("
+                  << r_us / total_us * 100.0 << "%)\n";
+#elif SEARCH_ALG == PQ_SDC_PIPELINE
+        std::cerr << "[stage] encode busy: " << e_us << " us  util="
+                  << e_us / total_us * 100.0 << "% of wall (1 thread)\n";
+        std::cerr << "[stage] scan busy:   " << s_us << " us  util="
+                  << s_us / (total_us * (double)SDC_SCAN_THREADS) * 100.0
+                  << "% of wall (" << SDC_SCAN_THREADS << " threads)\n";
+        std::cerr << "[stage] rerank busy: " << r_us << " us  util="
+                  << r_us / total_us * 100.0 << "% of wall (1 thread)\n";
+#endif
+    }
+#endif
+
 #if SEARCH_ALG == IVF_SIMD
     int64_t ivf_t_coarse = 0, ivf_t_scan = 0;
 #endif
@@ -840,8 +1041,18 @@ int main(int argc, char *argv[])
         auto res = hnsw_search_multi_entry_omp(
             hnsw_index, test_query + i*vecdim, k, HNSW_EF_SEARCH,
             base_number, FLAT_PTHREAD_THREADS);
+#elif SEARCH_ALG == PQ4_SCALAR
+        auto res = pq4_search_rerank(fs_index, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == PQ4_FASTSCAN
+        auto res = fastscan_search_rerank(fs_index, base, test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == OPQ_GATHER
+        auto res = opq_search_gather(opq_index, opq_pq_simd, base,
+                                     test_query + i*vecdim, k, p);
+#elif SEARCH_ALG == PQ_SDC_SEQ || SEARCH_ALG == PQ_SDC_PIPELINE || SEARCH_ALG == PQ_SDC_OMP
+        // Results computed in the pre-loop batch; move out for recall eval.
+        auto res = std::move(sdc_results[i]);
 #else
-        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–32)."
+        #error "Unknown SEARCH_ALG value. Set it to one of the defined constants (1–38)."
 #endif
 
         gettimeofday(&newVal, NULL);
@@ -856,6 +1067,9 @@ int main(int argc, char *argv[])
 #endif
 #if SEARCH_ALG == IVF_PQ_SIMD_PTHREAD || SEARCH_ALG == IVF_PQ_SIMD_OMP
         diff = ivfpq_batch_avg_us;
+#endif
+#if SEARCH_ALG >= PQ_SDC_SEQ && SEARCH_ALG <= PQ_SDC_OMP
+        diff = sdc_batch_avg_us;
 #endif
 
         std::set<uint32_t> gtset;

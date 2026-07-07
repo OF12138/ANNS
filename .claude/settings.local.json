@@ -20,7 +20,9 @@
       "Bash(python -c ' *)",
       "Bash(python *)",
       "Bash(where soffice *)",
-      "Read(//c/Program Files/LibreOffice/program/**)"
+      "Read(//c/Program Files/LibreOffice/program/**)",
+      "PowerShell(g++ *)",
+      "PowerShell(wsl -e bash -lc \"which g++ aarch64-linux-gnu-g++ qemu-aarch64 2>/dev/null; g++ --version 2>/dev/null | head -1\")"
     ]
   }
 }
